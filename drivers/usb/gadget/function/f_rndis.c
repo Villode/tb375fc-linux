@@ -106,8 +106,8 @@ static struct usb_interface_descriptor rndis_control_intf = {
 	/* status endpoint is optional; this could be patched later */
 	.bNumEndpoints =	1,
 	.bInterfaceClass =	USB_CLASS_COMM,
-	.bInterfaceSubClass =   USB_CDC_SUBCLASS_ACM,
-	.bInterfaceProtocol =   USB_CDC_ACM_PROTO_VENDOR,
+	.bInterfaceSubClass =   0x02,
+	.bInterfaceProtocol =   0xff,
 	/* .iInterface = DYNAMIC */
 };
 

@@ -1,3 +1,10 @@
+extern struct workqueue_struct *nvt_fwu_wq;
+
+#define BLD_BANK_ADDR 0x1FB500
+#define RD32(o) ((uint32_t)buf[1 + (o)] | ((uint32_t)buf[1 + (o) + 1] << 8) | \
+		 ((uint32_t)buf[1 + (o) + 2] << 16) | ((uint32_t)buf[1 + (o) + 3] << 24))
+#define RD24(o) ((uint32_t)buf[1 + (o)] | ((uint32_t)buf[1 + (o) + 1] << 8) | \
+		 ((uint32_t)buf[1 + (o) + 2] << 16))
 /*
  * Copyright (C) 2010 - 2018 Novatek, Inc.
  *
@@ -26,10 +33,21 @@
 #include <linux/delay.h>
 #include <linux/firmware.h>
 #include <linux/gpio.h>
+#include <linux/moduleparam.h>
 
 #include "nt36xxx.h"
 
 #if BOOT_UPDATE_FIRMWARE
+
+/* 见 nvt_write_sram()：默认关闭的逐笔回读校验 */
+static bool nvt_fwu_verify;
+module_param_named(fwu_verify, nvt_fwu_verify, bool, 0644);
+MODULE_PARM_DESC(fwu_verify, "Read back every SRAM write while flashing (debug only)");
+
+/* 2026-09-14 A/B knob: skip the cascade tx-auto-copy handshake */
+static bool nvt_no_autocopy;
+module_param_named(no_autocopy, nvt_no_autocopy, bool, 0644);
+MODULE_PARM_DESC(no_autocopy, "skip tx_auto_copy_mode/wait_auto_copy in hw_crc download");
 
 #define SIZE_4KB 4096
 #define FLASH_SECTOR_SIZE SIZE_4KB
@@ -157,6 +175,10 @@ static int32_t nvt_bin_header_parser(const u8 *fwdata, size_t fwsize)
 
 	/* Find the header size */
 	end = fwdata[0] + (fwdata[1] << 8) + (fwdata[2] << 16) + (fwdata[3] << 24);
+	if (fwdata[0x20] & 0x02) {
+		NVT_LOG("Cascade 2nd header detected (0x%02X), adjusting header size from 0x%X to 0x%X\n", fwdata[0x20], end, end / 2);
+		end = end / 2;
+	}
 	pos = 0x30;	/* info section start at 0x30 offset */
 	while (pos < end) {
 		info_sec_num ++;
@@ -543,13 +565,79 @@ static int32_t nvt_write_sram(const u8 *fwdata,
 			return ret;
 		}
 
-		/* ---write data into SRAM--- */
-		fwbuf[0] = SRAM_addr & 0x7F;
-		memcpy(fwbuf+1, &fwdata[BIN_addr], len);
-		ret = CTP_SPI_WRITE(ts->client, fwbuf, len+1);
-		if (ret) {
-			NVT_ERR("write to sram failed, ret = %d\n", ret);
-			return ret;
+		/* ---write data into SRAM (page-boundary safe)--- */
+		/*
+		 * ★ 页边界安全写入（2026-09-14 实测）：
+		 * IC 的 SPI 写引擎以 0x80 字节为一页，**跨页的传输会被整体丢弃**
+		 * （实测：在 SRAM 0x11417F 写 2 字节，IC 完全没有写入）。
+		 * ILM(0x0)/DLM(0x100000) 的块起点天然 0x80 对齐，所以 0xFC00 大块
+		 * 传输一直是对的（已与固件逐字节比对通过）；
+		 * 但 info 表末项 "Header" 的目标是 SRAM 0x114178（low7=0x78），
+		 * 那一笔 0x101 字节传输必然跨页 —— 现场实测它最终落到了 +0x40。
+		 * 这里把每笔传输裁到当前页内。
+		 */
+		{
+			uint32_t done = 0;
+
+			while (done < len) {
+				uint32_t space = 0x80 - ((SRAM_addr + done) & 0x7F);
+				uint32_t piece = len - done;
+
+				if (piece > space)
+					piece = space;
+
+				ret = nvt_set_page(SRAM_addr + done);
+				if (ret) {
+					NVT_ERR("set page failed, ret = %d\n", ret);
+					return ret;
+				}
+				fwbuf[0] = (SRAM_addr + done) & 0x7F;
+				memcpy(fwbuf + 1, &fwdata[BIN_addr + done], piece);
+				ret = CTP_SPI_WRITE(ts->client, fwbuf, piece + 1);
+				if (ret) {
+					NVT_ERR("write to sram failed, ret = %d\n", ret);
+					return ret;
+				}
+				done += piece;
+			}
+		}
+		/*
+		 * 逐笔回读校验 —— 纯调试用。开着它会让每笔 SRAM 写入都多一次 SPI 读
+		 * （240KB 固件 ≈ 多几百次事务）并且刷屏，量产/日常必须关。
+		 *   开启： nt36xxx_ts.fwu_verify=1
+		 */
+		if (nvt_fwu_verify) {
+			/*
+			 * 整块逐字节回读比对（0x40 对齐 —— 见 0x80 字节页内回绕规则）。
+			 * 只在这一层报告「差多少字节 / 第一个差异在哪」，
+			 * 用于判定 IC SRAM 里的固件是否与文件逐字节相同。
+			 */
+			uint32_t k, bad = 0, first = 0xFFFFFFFF;
+			uint8_t vb[0x81];
+
+			for (k = 0; k < len; k += 0x40) {
+				uint32_t piece = (len - k) > 0x40 ? 0x40 : (len - k);
+				uint32_t a = SRAM_addr + k;
+				uint32_t j;
+
+				memset(vb, 0, sizeof(vb));
+				nvt_set_page(a);
+				vb[0] = a & 0x7F;
+				if (CTP_SPI_READ(ts->client, vb, piece + 1)) {
+					NVT_ERR("[fwu-verify] read failed at 0x%06X\n", a);
+					break;
+				}
+				for (j = 0; j < piece; j++) {
+					if (vb[1 + j] != fwdata[BIN_addr + k + j]) {
+						if (first == 0xFFFFFFFF)
+							first = k + j;
+						bad++;
+					}
+				}
+			}
+			NVT_ERR("[fwu-verify] SRAM 0x%06X len=0x%X: %u bytes differ (first at +0x%s%X)\n",
+				SRAM_addr, len, bad,
+				(first == 0xFFFFFFFF) ? "0" : "", first == 0xFFFFFFFF ? 0 : first);
 		}
 
 		SRAM_addr += NVT_TRANSFER_LEN;
@@ -671,6 +759,61 @@ This function will set hw crc reg before enable crc function.
 return:
 	n.a.
 *******************************************************/
+static void nvt_tx_auto_copy_mode(void)
+{
+	if (ts->carrier_system == 1) {
+		nvt_write_addr(ts->mmap->CP_TP_CPU_REQ, 0x69);
+	} else if (ts->carrier_system == 2) {
+		nvt_write_addr(ts->mmap->CP_TP_CPU_REQ, 0x56);
+	}
+	NVT_LOG("tx auto copy mode %d enable\n", ts->carrier_system);
+}
+
+static int32_t nvt_check_tx_auto_copy(void)
+{
+	int32_t i = 0;
+	uint8_t buf[4] = {0};
+	int32_t retry = 200;
+
+	if (ts->mmap->CP_TP_CPU_REQ == 0) {
+		NVT_ERR("error, TX_AUTO_COPY_EN = 0\n");
+		return -1;
+	}
+
+	for (i = 0; i < retry; i++) {
+		nvt_set_page(ts->mmap->CP_TP_CPU_REQ);
+		buf[0] = ts->mmap->CP_TP_CPU_REQ & 0x7F;
+		buf[1] = 0xFF;
+		CTP_SPI_READ(ts->client, buf, 2);
+
+		if (buf[1] == 0x00) {
+			NVT_LOG("tx auto copy done (i=%d)!\n", i);
+			return 0;
+		}
+
+		usleep_range(1000, 1000);
+	}
+
+	NVT_ERR("tx auto copy timeout! i=%d, buf[1]=0x%02X\n", i, buf[1]);
+	return -ETIMEDOUT;
+}
+
+static int32_t nvt_wait_auto_copy(void)
+{
+	int32_t ret = 0;
+
+	if (ts->carrier_system == 2) {
+		ret = nvt_check_tx_auto_copy();
+	} else if (ts->carrier_system == 1) {
+		ret = 0;
+	} else {
+		NVT_ERR("failed, not support mode %d!\n", ts->carrier_system);
+		ret = -1;
+	}
+
+	return ret;
+}
+
 static void nvt_set_bld_crc_bank(uint32_t DES_ADDR, uint32_t SRAM_ADDR,
 		uint32_t LENGTH_ADDR, uint32_t size,
 		uint32_t G_CHECKSUM_ADDR, uint32_t crc)
@@ -684,19 +827,19 @@ static void nvt_set_bld_crc_bank(uint32_t DES_ADDR, uint32_t SRAM_ADDR,
 	CTP_SPI_WRITE(ts->client, fwbuf, 4);
 
 	/* write length */
-	/* nvt_set_page(LENGTH_ADDR); */
+	nvt_set_page(LENGTH_ADDR);
 	fwbuf[0] = LENGTH_ADDR & 0x7F;
 	fwbuf[1] = (size) & 0xFF;
 	fwbuf[2] = (size >> 8) & 0xFF;
-	fwbuf[3] = (size >> 16) & 0x01;
+	fwbuf[3] = (size >> 16) & 0xFF;
 	if (ts->hw_crc == 1) {
 		CTP_SPI_WRITE(ts->client, fwbuf, 3);
 	} else if (ts->hw_crc > 1) {
 		CTP_SPI_WRITE(ts->client, fwbuf, 4);
 	}
 
-	/* write golden dlm checksum */
-	/* nvt_set_page(G_CHECKSUM_ADDR); */
+	/* write golden checksum */
+	nvt_set_page(G_CHECKSUM_ADDR);
 	fwbuf[0] = G_CHECKSUM_ADDR & 0x7F;
 	fwbuf[1] = (crc) & 0xFF;
 	fwbuf[2] = (crc >> 8) & 0xFF;
@@ -796,6 +939,77 @@ static void nvt_read_bld_hw_crc(void)
 			bin_map[1].crc, g_crc, r_crc);
 
 	return;
+}
+
+/* ---------------------------------------------------------------------------
+ * Diagnostic: dump the NT36532 BLD-CRC register bank (0x1FB500..0x1FB53F).
+ * Added 2026-09-14 to trace the hw_crc download flow.  Purely read-only.
+ * ------------------------------------------------------------------------- */
+void nvt_dump_bld_bank(const char *tag)
+{
+	uint8_t buf[66] = {0};
+	uint32_t g_ilm, g_dlm, r_ilm, r_dlm;
+	uint32_t bld_des, ilm_des, dlm_des, ilm_len, dlm_len, bld_len;
+	int32_t ret;
+	int i;
+
+	nvt_set_page(BLD_BANK_ADDR);
+	buf[0] = (uint8_t)(BLD_BANK_ADDR & 0x7F);
+	ret = CTP_SPI_READ(ts->client, buf, 65);
+	if (ret) {
+		NVT_ERR("[bld:%s] SPI read failed (%d)\n", tag, ret);
+		return;
+	}
+
+	NVT_ERR("[bld:%s] raw 0x1FB500..0x1FB53F:\n", tag);
+	for (i = 0; i < 64; i += 16) {
+		NVT_ERR("  %02X %02X %02X %02X %02X %02X %02X %02X  %02X %02X %02X %02X %02X %02X %02X %02X\n",
+			buf[1 + i + 0], buf[1 + i + 1], buf[1 + i + 2], buf[1 + i + 3],
+			buf[1 + i + 4], buf[1 + i + 5], buf[1 + i + 6], buf[1 + i + 7],
+			buf[1 + i + 8], buf[1 + i + 9], buf[1 + i + 10], buf[1 + i + 11],
+			buf[1 + i + 12], buf[1 + i + 13], buf[1 + i + 14], buf[1 + i + 15]);
+	}
+
+	g_ilm   = RD32(0x00); g_dlm   = RD32(0x04);
+	r_ilm   = RD32(0x20); r_dlm   = RD32(0x24);
+	bld_des = RD24(0x14); ilm_des = RD24(0x28); dlm_des = RD24(0x2C);
+	ilm_len = RD24(0x18); dlm_len = RD24(0x30); bld_len = RD24(0x38);
+
+	NVT_ERR("[bld:%s] G_ILM=0x%08X G_DLM=0x%08X | R_ILM=0x%08X R_DLM=0x%08X\n",
+		tag, g_ilm, g_dlm, r_ilm, r_dlm);
+	NVT_ERR("[bld:%s] DES bld=0x%06X ilm=0x%06X dlm=0x%06X | LEN ilm=0x%06X dlm=0x%06X bld=0x%06X\n",
+		tag, bld_des, ilm_des, dlm_des, ilm_len, dlm_len, bld_len);
+	NVT_ERR("[bld:%s] BOOT_RDY=0x%02X ILMDLM_CRC=0x%02X DMA_CRC_FLAG=0x%02X BLD_CRC_EN=0x%02X"
+		" w508=%02X%02X%02X%02X w50C=%02X%02X%02X%02X w510=%02X%02X%02X%02X w51C=%02X%02X%02X%02X\n",
+		tag, buf[1 + 0x0D], buf[1 + 0x33], buf[1 + 0x34], buf[1 + 0x36],
+		buf[1 + 0x0B], buf[1 + 0x0A], buf[1 + 0x09], buf[1 + 0x08],
+		buf[1 + 0x0F], buf[1 + 0x0E], buf[1 + 0x0D], buf[1 + 0x0C],
+		buf[1 + 0x13], buf[1 + 0x12], buf[1 + 0x11], buf[1 + 0x10],
+		buf[1 + 0x1F], buf[1 + 0x1E], buf[1 + 0x1D], buf[1 + 0x1C]);
+
+	/* 2026-09-14: 0x1FC900 looks like a SECOND copy of the same BLD layout
+	 * (peer / slave of the cascade pair).  Dump it alongside so the two
+	 * halves of the negotiation can be compared. */
+	{
+		uint8_t alt[66] = {0};
+		int k;
+		nvt_set_page(0x1FC900);
+		alt[0] = 0x1FC900 & 0x7F;
+		if (CTP_SPI_READ(ts->client, alt, 65) == 0) {
+			for (k = 0; k < 64; k += 16) {
+				NVT_ERR("[bld:%s] peer 0x1FC9%02X %02X %02X %02X %02X %02X %02X %02X  %02X %02X %02X %02X %02X %02X %02X %02X\n",
+					tag, k,
+					alt[1+k+0], alt[1+k+1], alt[1+k+2], alt[1+k+3],
+					alt[1+k+4], alt[1+k+5], alt[1+k+6], alt[1+k+7],
+					alt[1+k+8], alt[1+k+9], alt[1+k+10], alt[1+k+11],
+					alt[1+k+12], alt[1+k+13], alt[1+k+14], alt[1+k+15]);
+			}
+		} else {
+			NVT_ERR("[bld:%s] peer bank 0x1FC900 read failed\n", tag);
+		}
+	}
+
+	nvt_set_page(ts->mmap->EVENT_BUF_ADDR);
 }
 
 #if NVT_TOUCH_ESD_DISP_RECOVERY
@@ -991,6 +1205,109 @@ function. It's complete download firmware flow.
 return:
 	Executive outcomes. 0---succeed. else---fail.
 *******************************************************/
+/*******************************************************
+Description:
+	把 EVENT_BUF 前 0x80 字节全量 dump 出来（0x80 页内，安全）。
+	用于在 reset_state 卡住时寻找隐藏的状态位。
+*******************************************************/
+static void nvt_dump_event_buf(const char *tag)
+{
+	uint8_t buf[0x81];
+	int i;
+
+	memset(buf, 0, sizeof(buf));
+	nvt_set_page(ts->mmap->EVENT_BUF_ADDR);
+	buf[0] = ts->mmap->EVENT_BUF_ADDR & 0x7F;
+	if (CTP_SPI_READ(ts->client, buf, 0x81)) {
+		NVT_ERR("[evbuf:%s] read failed\n", tag);
+		return;
+	}
+	for (i = 0; i < 0x80; i += 16) {
+		NVT_ERR("[evbuf:%s] +%02X: %02X %02X %02X %02X %02X %02X %02X %02X  "
+			"%02X %02X %02X %02X %02X %02X %02X %02X\n", tag, i,
+			buf[1+i+0], buf[1+i+1], buf[1+i+2], buf[1+i+3],
+			buf[1+i+4], buf[1+i+5], buf[1+i+6], buf[1+i+7],
+			buf[1+i+8], buf[1+i+9], buf[1+i+10], buf[1+i+11],
+			buf[1+i+12], buf[1+i+13], buf[1+i+14], buf[1+i+15]);
+	}
+}
+
+/*******************************************************
+Description:
+	决定性实验（只在首次失败路径调用一次）：
+	  1. 读出 IC 自己算出的 R_DLM
+	  2. 以它作为 golden 重跑一遍完整 hw_crc 下载
+	  3. 再查 reset_state
+
+	若第 3 步通过 ⇒ 「DLM golden 与 IC 计算结果不匹配」就是启动门；
+	若仍不过 ⇒ DLM CRC 不是启动门，问题在环境（显示/TDDI 等）。
+*******************************************************/
+static void nvt_dlm_golden_retry(void)
+{
+	uint8_t buf[16] = {0};
+	uint32_t g_ilm, g_dlm, r_ilm, r_dlm, orig;
+	int32_t ret;
+
+	memset(buf, 0, sizeof(buf));
+	nvt_set_page(BLD_BANK_ADDR);
+	buf[0] = BLD_BANK_ADDR & 0x7F;
+	if (CTP_SPI_READ(ts->client, buf, 9)) {
+		NVT_ERR("[dlm-retry] bank read failed\n");
+		return;
+	}
+	g_ilm = RD32(0x00);
+	g_dlm = RD32(0x04);
+	r_ilm = RD32(0x20);
+	r_dlm = RD32(0x24);
+
+	NVT_ERR("[dlm-retry] bank now: G_ILM=0x%08X R_ILM=0x%08X | G_DLM=0x%08X R_DLM=0x%08X\n",
+		g_ilm, r_ilm, g_dlm, r_dlm);
+	NVT_ERR("[dlm-retry] bin: ILM crc=0x%08X DLM crc=0x%08X  (ILMDLM_CRC=0x%02X)\n",
+		bin_map[0].crc, bin_map[1].crc, buf[1 + 0x33]);
+
+	nvt_dump_event_buf("after-fail");
+
+	orig = bin_map[1].crc;
+	bin_map[1].crc = r_dlm;
+
+	NVT_ERR("[dlm-retry] re-running download with G_DLM := R_DLM = 0x%08X\n", r_dlm);
+
+	nvt_bootloader_reset();
+	nvt_set_bld_hw_crc();
+	nvt_tx_auto_copy_mode();
+	ret = nvt_write_firmware(fw_entry->data, fw_entry->size);
+	if (ret) {
+		NVT_ERR("[dlm-retry] write failed (%d)\n", ret);
+		goto out;
+	}
+	ret = nvt_wait_auto_copy();
+	if (ret) {
+		NVT_ERR("[dlm-retry] autocopy failed (%d)\n", ret);
+		goto out;
+	}
+	nvt_fw_crc_enable();
+	nvt_boot_ready();
+
+	ret = nvt_check_fw_reset_state(RESET_STATE_INIT);
+	NVT_ERR("[dlm-retry] RESULT: check_fw_reset_state(INIT) = %d\n", ret);
+	if (!ret) {
+		nvt_dump_event_buf("dlm-retry-OK");
+		nvt_change_mode(0);
+		nvt_check_fw_reset_state(RESET_STATE_NORMAL_RUN);
+	} else {
+		memset(buf, 0, sizeof(buf));
+		nvt_set_page(BLD_BANK_ADDR);
+		buf[0] = BLD_BANK_ADDR & 0x7F;
+		CTP_SPI_READ(ts->client, buf, 9);
+		NVT_ERR("[dlm-retry] bank after: G_DLM=0x%08X R_DLM=0x%08X ILMDLM_CRC=0x%02X\n",
+			RD32(0x04), RD32(0x24), buf[1 + 0x33]);
+	}
+
+out:
+	bin_map[1].crc = orig;
+	return;
+}
+
 static int32_t nvt_download_firmware_hw_crc(void)
 {
 	uint8_t retry = 0;
@@ -999,8 +1316,21 @@ static int32_t nvt_download_firmware_hw_crc(void)
 	start = ktime_get();
 
 	while (1) {
+		/* vendor-faithful: no reset per retry (vendor relies on the single probe-level reset) */
+
 		/* bootloader reset to reset MCU */
 		nvt_bootloader_reset();
+		nvt_dump_bld_bank("1-after-bootloader-reset");
+
+		/* set ilm & dlm reg bank (MUST precede write_firmware as in vendor nt36532.ko) */
+		nvt_set_bld_hw_crc();
+		nvt_dump_bld_bank("2-after-set-bld-hw-crc");
+
+		/* cascade tx auto copy mode */
+		if (nvt_no_autocopy)
+			NVT_ERR("[noautocopy] skipping tx_auto_copy_mode\n");
+		else
+			nvt_tx_auto_copy_mode();
 
 		/* Start to write firmware process */
 		ret = nvt_write_firmware(fw_entry->data, fw_entry->size);
@@ -1009,6 +1339,14 @@ static int32_t nvt_download_firmware_hw_crc(void)
 			goto fail;
 		}
 
+		/* wait for auto copy to complete */
+		ret = nvt_no_autocopy ? 0 : nvt_wait_auto_copy();
+		if (ret) {
+			NVT_ERR("nvt_wait_auto_copy failed. (%d)\n", ret);
+			goto fail;
+		}
+		nvt_dump_bld_bank("3-after-write+autocopy");
+
 #if NVT_DUMP_PARTITION
 		ret = nvt_dump_partition();
 		if (ret) {
@@ -1016,23 +1354,32 @@ static int32_t nvt_download_firmware_hw_crc(void)
 		}
 #endif
 
-		/* set ilm & dlm reg bank */
-		nvt_set_bld_hw_crc();
-
-		/* enable hw bld crc function */
-		nvt_bld_crc_enable();
-
 		/* clear fw reset status & enable fw crc check */
 		nvt_fw_crc_enable();
+		nvt_dump_bld_bank("4-after-fw-crc-enable");
 
 		/* Set Boot Ready Bit */
 		nvt_boot_ready();
+		nvt_dump_bld_bank("5-after-boot-ready");
 
 		ret = nvt_check_fw_reset_state(RESET_STATE_INIT);
 		if (ret) {
 			NVT_ERR("nvt_check_fw_reset_state failed. (%d)\n", ret);
+			/* ★ 决定性实验：只在第一轮做一次，之后按原逻辑重试 */
+			if (retry == 0) {
+				nvt_dlm_golden_retry();
+				ret = nvt_check_fw_reset_state(RESET_STATE_INIT);
+				NVT_ERR("[dlm-retry] post-experiment reset_state check = %d\n", ret);
+				if (!ret) {
+					nvt_change_mode(0);
+					nvt_check_fw_reset_state(RESET_STATE_NORMAL_RUN);
+					break;
+				}
+			}
 			goto fail;
 		} else {
+			nvt_change_mode(0);
+			nvt_check_fw_reset_state(RESET_STATE_NORMAL_RUN);
 			break;
 		}
 
@@ -1118,13 +1465,14 @@ static int32_t nvt_download_firmware(void)
 		}
 
 		/* check fw checksum result */
-		ret = nvt_check_fw_checksum();
-		if (ret) {
-			NVT_ERR("firmware checksum not match, retry=%d\n", retry);
-			goto fail;
-		} else {
-			break;
+		if (!ts->hw_crc) {
+			ret = nvt_check_fw_checksum();
+			if (ret) {
+				NVT_ERR("firmware checksum not match, retry=%d\n", retry);
+				goto fail;
+			}
 		}
+		break;
 
 fail:
 		retry++;
@@ -1150,6 +1498,17 @@ int32_t nvt_update_firmware(const char *firmware_name)
 {
 	int32_t ret = 0;
 
+	/*
+	 * 唯一的擦写入口：所有路径（boot 更新 / ESD-WDT 恢复 / proc sysfs）都过这里，
+	 * 所以闸门放在这个点上最稳。没有校验过芯片身份就不允许触碰 flash。
+	 */
+	if (!ts->fw_update_allowed) {
+		NVT_ERR("chip identity NOT verified -> refusing to write flash (%s).\n",
+			firmware_name);
+		NVT_ERR("  set nt36xxx_ts.force_fw_update=1 only after the chip answers correctly\n");
+		return -EPERM;
+	}
+
 	/* request bin file in "/etc/firmware" */
 	ret = update_firmware_request(firmware_name);
 	if (ret) {
@@ -1162,6 +1521,22 @@ int32_t nvt_update_firmware(const char *firmware_name)
 	if (ret) {
 		NVT_ERR("Download Init failed. (%d)\n", ret);
 		goto download_fail;
+	}
+
+	if (bin_map) {
+		int _i;
+		for (_i = 0; _i < 2; _i++)
+			NVT_ERR("[bld:0-bin-map] [%d]%s BIN=0x%06X SRAM=0x%06X size=0x%06X crc=0x%08X\n",
+				_i, bin_map[_i].name, bin_map[_i].BIN_addr, bin_map[_i].SRAM_addr,
+				bin_map[_i].size, bin_map[_i].crc);
+	}
+
+	/* 2026-09-14: prove the runtime map equals the vendor table */
+	{
+		const uint32_t *mp = (const uint32_t *)ts->mmap;
+		int _k;
+		for (_k = 0; _k < (int)(sizeof(*ts->mmap) / sizeof(uint32_t)); _k++)
+			NVT_ERR("[mmap] [%02d] = 0x%08X\n", _k, mp[_k]);
 	}
 
 	/* download firmware process */
@@ -1177,11 +1552,11 @@ int32_t nvt_update_firmware(const char *firmware_name)
 	NVT_LOG("Update firmware success! <%ld us>\n",
 			(long) ktime_us_delta(end, start));
 
-	/* Get FW Info */
-	ret = nvt_get_fw_info();
-	if (ret) {
-		NVT_ERR("nvt_get_fw_info failed. (%d)\n", ret);
+	/* Get FW Info (non-fatal, matches vendor nt36532.ko line 7008/702c behavior) */
+	if (nvt_get_fw_info()) {
+		NVT_LOG("nvt_get_fw_info deferred / non-fatal\n");
 	}
+	ret = 0;
 
 download_fail:
 	if (!IS_ERR_OR_NULL(bin_map)) {
@@ -1205,19 +1580,57 @@ return:
 *******************************************************/
 void Boot_Update_Firmware(struct work_struct *work)
 {
+	int32_t ret = 0;
+
+	/*
+	 * ★ 安全闸门（2026-09-12）：只有在 probe 里真正读回过有效的 chip ID 才允许
+	 *   擦写 flash。否则 SPI 读回恒为 0 时也会照走完整流程 —— 包括 erase ——
+	 *   把固件刷给一颗身份不明的芯片；写错的东西掉电后不会自愈。
+	 */
+	if (!ts->fw_update_allowed) {
+		NVT_ERR("chip identity NOT verified -> skipping firmware flash "
+			"(running on the IC's built-in firmware)\n");
+		NVT_ERR("  set nt36xxx_ts.force_fw_update=1 only after the chip answers correctly\n");
+		nvt_change_mode(0);
+		nvt_check_fw_reset_state(RESET_STATE_NORMAL_RUN);
+		nvt_get_fw_info();
+		pm_relax(&ts->client->dev);
+		return;
+	}
+
 	nvt_match_fw();
 	mutex_lock(&ts->lock);
-	NVT_LOG("BOOT FW update start\n");
-	if (nvt_get_dbgfw_status()) {
-		if (nvt_update_firmware(DEFAULT_DEBUG_FW_NAME) < 0) {
-			NVT_ERR("use built-in fw");
-			nvt_update_firmware(ts->fw_name);
-		}
+	NVT_LOG("BOOT FW update start (fw=%s)\n", ts->fw_name);
+	ret = nvt_update_firmware(ts->fw_name);
+	if (ret) {
+		const char *alt_fw = (strcmp(ts->fw_name, DEFAULT_BOOT_UPDATE_FIRMWARE_FIRST) == 0) ?
+				     DEFAULT_BOOT_UPDATE_FIRMWARE_SECOND : DEFAULT_BOOT_UPDATE_FIRMWARE_FIRST;
+		const char *alt_mp = (strcmp(ts->fw_name, DEFAULT_BOOT_UPDATE_FIRMWARE_FIRST) == 0) ?
+				     DEFAULT_MP_UPDATE_FIRMWARE_SECOND : DEFAULT_MP_UPDATE_FIRMWARE_FIRST;
+		NVT_ERR("Update firmware %s failed (%d), trying alternate %s...\n",
+			ts->fw_name, ret, alt_fw);
+		ts->fw_name = alt_fw;
+		ts->mp_name = alt_mp;
+		ret = nvt_update_firmware(ts->fw_name);
+		if (ret)
+			NVT_ERR("Alternate panel firmware also failed (%d)!\n", ret);
+	}
+	if (ret == 0) {
+		ts->fw_ready = true;
+		NVT_LOG("Touch firmware update SUCCESS! Touchscreen is now ACTIVE.\n");
+		nvt_change_mode(0);
+		nvt_check_fw_reset_state(RESET_STATE_NORMAL_RUN);
 	} else {
-		nvt_update_firmware(ts->fw_name);
+		static int fwu_retry_cnt;
+		if (fwu_retry_cnt < 20) {
+			fwu_retry_cnt++;
+			NVT_LOG("Touch FW update failed (%d), will retry in 3s (attempt %d/20)...\n", ret, fwu_retry_cnt);
+			queue_delayed_work(nvt_fwu_wq, &ts->nvt_fwu_work, msecs_to_jiffies(3000));
+		}
 	}
 	nvt_get_fw_info();
-	NVT_LOG("BOOT FW update done\n");
+	nvt_set_page(ts->mmap->EVENT_BUF_ADDR);
+	NVT_LOG("BOOT FW update done, ret=%d\n", ret);
 	mutex_unlock(&ts->lock);
 	pm_relax(&ts->client->dev);
 }

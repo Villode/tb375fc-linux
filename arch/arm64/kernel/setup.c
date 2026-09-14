@@ -263,8 +263,9 @@ static int __init __maybe_unused xaga_gpu_power_on(void)
 #define XAGA_TOP_PA	0x10000000UL
 #define XAGA_GPIO_PA	0x10005000UL
 
-static int __init xaga_i2c_power_on(void)
+static int __init __maybe_unused xaga_i2c_power_on(void)
 {
+	return 0;
 	void __iomem *impc = ioremap(XAGA_IMPC_PA, 0x1000);
 	void __iomem *peri = ioremap(XAGA_PERI_PA, 0x1000);
 	void __iomem *top = ioremap(XAGA_TOP_PA, 0x1000);
@@ -612,8 +613,7 @@ static int __init xaga_i2c_power_on(void)
 
 	return 0;
 }
-postcore_initcall(xaga_i2c_power_on);
-
+/* postcore_initcall(xaga_i2c_power_on); */
 static int num_standard_resources;
 static struct resource *standard_resources;
 
@@ -837,6 +837,142 @@ u64 cpu_logical_map(unsigned int cpu)
 	return __cpu_logical_map[cpu];
 }
 
+
+
+
+
+
+
+/* --- TB-CANARY-BEGIN --- */
+#include <linux/io.h>
+#include <asm/early_ioremap.h>
+
+void tb_canary(int n);
+void tb_canary_solid(void);
+void tb_wdt_disable(void);
+
+/* ================= TB375FC bring-up canary =================
+ * 见 tools/patch_boot_canary.py 顶部说明。
+ */
+#define TB_FB_PHYS    0xfc16f000UL
+#define TB_FB_STRIDE  11776
+#define TB_FB_W       2944
+#define TB_FB_Y       860          /* 屏幕中部，比底部更容易被看到 */
+#define TB_FB_H       220
+#define TB_BLK_W      200
+#define TB_BLK_GAP    40
+#define TB_MAXBLK     12
+#define TB_HOLD_MS    300
+/* ★ early_memremap 单次有上限（fixmap 槽位，约 128KB，实测 20MB 直接返回 NULL）。
+   之前就是映射 20MB 失败，探针一个像素都没画出来。
+   所以分块：每次只映射 4 行 = 11776*4 = 47KB。 */
+#define TB_CHUNK_ROWS 4
+
+/* MTK RGU 看门狗（厂商 DTB: watchdog@1c00a000）
+ * 关狗 = 写 WDT_MODE = KEY(0x22000000) 且 ENABLE(bit0)=0 */
+#define TB_RGU_PHYS   0x1c00a000UL
+#define TB_WDT_MODE   0x00
+#define TB_WDT_KEY    0x22000000u
+
+static bool tb_canary_active = true;
+static void __init tb_canary_stop(void)
+{
+	tb_canary_active = false;
+}
+
+/* 用系统计数器延时：早期 loops_per_jiffy 还没校准，用它会离谱 */
+static void __init tb_delay_ms(unsigned ms)
+{
+	u64 freq, t0, t1, d;
+	u64 guard = (u64)ms * 2000000ULL;
+
+	asm volatile("mrs %0, cntfrq_el0" : "=r" (freq));
+	asm volatile("mrs %0, cntvct_el0" : "=r" (t0));
+	if (!freq)
+		return;
+	d = freq * ms / 1000;
+	do {
+		asm volatile("isb" ::: "memory");
+		asm volatile("mrs %0, cntvct_el0" : "=r" (t1));
+		if (--guard == 0)
+			break;
+	} while (t1 - t0 < d);
+}
+
+/* n >= 0 : 画 n 个白块；n < 0 : 整条实心白（用作出场信号，与"方块"区分开） */
+static void __init tb_draw(int n)
+{
+	int y, x, k, r, rows;
+	unsigned long bytes;
+
+	if (!tb_canary_active)
+		return;
+
+	for (y = 0; y < TB_FB_H; y += TB_CHUNK_ROWS) {
+		unsigned long off = (unsigned long)(TB_FB_Y + y) * TB_FB_STRIDE;
+		void __iomem *fb;
+
+		rows = TB_CHUNK_ROWS;
+		if (rows > TB_FB_H - y)
+			rows = TB_FB_H - y;
+		bytes = (unsigned long)rows * TB_FB_STRIDE;   /* 4 行 = 47KB，安全 */
+
+		/* ★ 必须用 early_ioremap（device / 无缓存属性），不能用 early_memremap
+		   （那是 Normal 带缓存）。显示控制器是非一致性 master，写进 cache 的数据
+		   它根本看不到 —— 用错映射的话屏幕上一个像素都不会变。 */
+		if (!slab_is_available())
+			fb = early_ioremap(TB_FB_PHYS + off, bytes);
+		else
+			fb = ioremap(TB_FB_PHYS + off, bytes);
+		if (!fb)
+			return;
+
+		for (r = 0; r < rows; r++) {
+			u32 *row = (u32 *)(fb + (unsigned long)r * TB_FB_STRIDE);
+			for (x = 0; x < TB_FB_W; x++) {
+				if (n < 0) {
+					row[x] = 0xFFFFFFFFu;
+					continue;
+				}
+				k = x / (TB_BLK_W + TB_BLK_GAP);
+				row[x] = (k < n && (x % (TB_BLK_W + TB_BLK_GAP)) < TB_BLK_W)
+					 ? 0xFFFFFFFFu : 0xFF000000u;
+			}
+		}
+
+		if (!slab_is_available())
+			early_iounmap(fb, bytes);
+		else
+			iounmap(fb);
+	}
+}
+
+void __init tb_canary(int n)
+{
+	if (n > TB_MAXBLK)
+		n = TB_MAXBLK;
+	tb_draw(n);
+	tb_delay_ms(TB_HOLD_MS);
+}
+
+/* 出场信号：一条整条实心白，跟后面的"方块"明显不同 */
+void __init tb_canary_solid(void)
+{
+	tb_draw(-1);
+	tb_delay_ms(TB_HOLD_MS);
+}
+
+void __init tb_wdt_disable(void)
+{
+	void __iomem *rgu = early_ioremap(TB_RGU_PHYS, 0x100);
+
+	if (rgu) {
+		writel(TB_WDT_KEY, rgu + TB_WDT_MODE);   /* KEY + ENABLE=0 => 关狗 */
+		early_iounmap(rgu, 0x100);
+	}
+}
+/* --- TB-CANARY-END --- */
+
 void __init __no_sanitize_address setup_arch(char **cmdline_p)
 {
 	setup_initial_init_mm(_text, _etext, _edata, _end);
@@ -847,17 +983,23 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 
 	early_fixmap_init();
 	early_ioremap_init();
+	tb_wdt_disable();
+	tb_canary_solid();
+	tb_canary(1);
 
 	/* Earliest point the fixmap maps the xaga log_store ring (0x7ffbf000);
 	 * from here on every printk() is mirrored into it, and LK restores the
 	 * region into expdb on the next boot. */
-	xaga_marker_early_init();
+	/* 原 xaga 专用：往写死的 0x7ffbf000 写日志环。该地址在本机是
+	 * me_GPUEB_SHARED（厂商 DTB mblock-32: 0x7fe70000+0x180000），
+	 * 写它可能挂死总线且不留日志 —— 已禁用。 */
 
 	setup_machine_fdt(__fdt_pointer);
+	tb_canary(2);
 
 	/*
 	 * XAGA: override the FDT LK handed us (its Android DT) with our own
-	 * embedded mt6895-xiaomi-xaga.dtb. Doing this right after
+	 * embedded mt6897-lenovo-tb375fc.dtb. Doing this right after
 	 * setup_machine_fdt() (which already consumed /chosen bootargs and
 	 * /memory from LK's FDT into memblock) means EVERYTHING that follows
 	 * uses OUR tree: early_init_fdt_scan_reserved_mem() in
@@ -865,14 +1007,14 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 	 * region, paging_init() will exclude it from the direct map, and
 	 * unflatten_device_tree() builds the driver tree from ours.
 	 */
-	extern char _binary_arch_arm64_boot_dts_mediatek_mt6895_xiaomi_xaga_dtb_start[];
-	extern char _binary_arch_arm64_boot_dts_mediatek_mt6895_xiaomi_xaga_dtb_end[];
+	extern char _binary_arch_arm64_boot_dts_mediatek_mt6897_lenovo_tb375fc_dtb_start[];
+	extern char _binary_arch_arm64_boot_dts_mediatek_mt6897_lenovo_tb375fc_dtb_end[];
 	if (acpi_disabled) {
 		pr_info("XAGA-DTB: overriding LK FDT with embedded "
-			"mt6895-xiaomi-xaga.dtb (%d bytes)\n",
-			(int)(_binary_arch_arm64_boot_dts_mediatek_mt6895_xiaomi_xaga_dtb_end -
-			      _binary_arch_arm64_boot_dts_mediatek_mt6895_xiaomi_xaga_dtb_start));
-		initial_boot_params = _binary_arch_arm64_boot_dts_mediatek_mt6895_xiaomi_xaga_dtb_start;
+			"mt6897-lenovo-tb375fc.dtb (%d bytes)\n",
+			(int)(_binary_arch_arm64_boot_dts_mediatek_mt6897_lenovo_tb375fc_dtb_end -
+			      _binary_arch_arm64_boot_dts_mediatek_mt6897_lenovo_tb375fc_dtb_start));
+		initial_boot_params = _binary_arch_arm64_boot_dts_mediatek_mt6897_lenovo_tb375fc_dtb_start;
 
 		/*
 		 * LK's cmdline was already captured by setup_machine_fdt()
@@ -884,6 +1026,7 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 		 */
 		early_init_dt_scan_chosen(boot_command_line);
 		pr_info("XAGA-CMDLINE: %s\n", boot_command_line);
+		tb_canary(3);
 
 		/*
 		 * Keep every clock/power-domain running. LK left the display
@@ -903,6 +1046,7 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 	 */
 	jump_label_init();
 	parse_early_param();
+	tb_canary(4);
 
 	dynamic_scs_init();
 
@@ -936,8 +1080,10 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 	}
 
 	arm64_memblock_init();
+	tb_canary(5);
 
 	paging_init();
+	tb_canary(6);
 
 	acpi_table_upgrade();
 
@@ -947,11 +1093,14 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 	if (acpi_disabled)
 		unflatten_device_tree();
 
+	tb_canary(7);
 	bootmem_init();
 
 	kasan_init();
 	request_standard_resources();
 
+	tb_canary(8);
+	tb_canary_stop();
 	early_ioremap_reset();
 
 	if (acpi_disabled)

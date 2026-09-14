@@ -6,11 +6,11 @@
 #include <linux/delay.h>
 #include <linux/i2c.h>
 #include <linux/power_supply.h>
-#include <linux/regmap.h>
 
 #define REG_BATID			0x00 /* This one is very unclear */
  #define BATID_101			0x0101 /* 107kOhm */
  #define BATID_102			0x0102 /* 10kOhm */
+ #define BATID_103			0x0103 /* Lenovo Xiaoxin Pad Pro TB375FC */
 #define REG_TEMPERATURE			0x06
 #define REG_VOLTAGE			0x08
 #define REG_FLAGS			0x0a
@@ -41,30 +41,64 @@
 
 struct mm8013_chip {
 	struct i2c_client *client;
-	struct regmap *regmap;
 };
+
+/* MM8013 16-bit fields = two consecutive 8-bit registers, little-endian:
+ * reg N = low byte, reg N+1 = high byte.  The SMBUS word path is unreliable
+ * on the MTK adapter (2nd byte comes back 0x00/0xFF), so read each byte
+ * separately and combine, retrying while a byte reads 0xFF (bus fill).
+ */
+static int mm8013_read_reg(struct mm8013_chip *chip, unsigned int reg, u32 *val)
+{
+	int lo, hi, retry;
+
+	for (retry = 0; retry < 5; retry++) {
+		lo = i2c_smbus_read_byte_data(chip->client, reg);
+		if (lo < 0)
+			return lo;
+		hi = i2c_smbus_read_byte_data(chip->client, reg + 1);
+		if (hi < 0)
+			return hi;
+		if (lo != 0xff && hi != 0xff) {
+			*val = (hi << 8) | lo;
+			return 0;
+		}
+		usleep_range(2000, 4000);
+	}
+	dev_err(&chip->client->dev, "MM8013 reg 0x%02X read unstable\n", reg);
+	return -EIO;
+}
+
+static int mm8013_write_reg(struct mm8013_chip *chip, unsigned int reg, u16 val)
+{
+	return i2c_smbus_write_word_data(chip->client, reg, val);
+}
 
 static int mm8013_checkdevice(struct mm8013_chip *chip)
 {
 	int battery_id, ret;
 	u32 val;
 
-	ret = regmap_write(chip->regmap, REG_BATID, 0x0008);
+	ret = mm8013_write_reg(chip, REG_BATID, 0x0008);
 	if (ret < 0)
 		return ret;
 
-	ret = regmap_read(chip->regmap, REG_BATID, &val);
+	ret = mm8013_read_reg(chip, REG_BATID, &val);
 	if (ret < 0)
 		return ret;
 
-	if (val == BATID_102)
+	if (val == BATID_103)
+		battery_id = 3;
+	else if (val == BATID_102)
 		battery_id = 2;
 	else if (val == BATID_101)
 		battery_id = 1;
-	else
-		return -EINVAL;
+	else {
+		dev_warn(&chip->client->dev, "Unknown BATID 0x%04x, proceeding with battery_id=1\n", val);
+		battery_id = 1;
+	}
 
-	dev_dbg(&chip->client->dev, "battery_id: %d\n", battery_id);
+	dev_info(&chip->client->dev, "MM8013 detected with battery_id: %d (val=0x%04x)\n", battery_id, val);
 
 	return 0;
 }
@@ -96,56 +130,56 @@ static int mm8013_get_property(struct power_supply *psy,
 
 	switch (psp) {
 	case POWER_SUPPLY_PROP_CAPACITY:
-		ret = regmap_read(chip->regmap, REG_STATE_OF_CHARGE, &regval);
+		ret = mm8013_read_reg(chip, REG_STATE_OF_CHARGE, &regval);
 		if (ret < 0)
 			return ret;
 
 		val->intval = regval;
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_FULL:
-		ret = regmap_read(chip->regmap, REG_FULL_CHARGE_CAPACITY, &regval);
+		ret = mm8013_read_reg(chip, REG_FULL_CHARGE_CAPACITY, &regval);
 		if (ret < 0)
 			return ret;
 
 		val->intval = 1000 * regval;
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
-		ret = regmap_read(chip->regmap, REG_DESIGN_CAPACITY, &regval);
+		ret = mm8013_read_reg(chip, REG_DESIGN_CAPACITY, &regval);
 		if (ret < 0)
 			return ret;
 
 		val->intval = 1000 * regval;
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_NOW:
-		ret = regmap_read(chip->regmap, REG_NOMINAL_CHARGE_CAPACITY, &regval);
+		ret = mm8013_read_reg(chip, REG_NOMINAL_CHARGE_CAPACITY, &regval);
 		if (ret < 0)
 			return ret;
 
 		val->intval = 1000 * regval;
 		break;
 	case POWER_SUPPLY_PROP_CURRENT_MAX:
-		ret = regmap_read(chip->regmap, REG_MAX_LOAD_CURRENT, &regval);
+		ret = mm8013_read_reg(chip, REG_MAX_LOAD_CURRENT, &regval);
 		if (ret < 0)
 			return ret;
 
 		val->intval = -1000 * (s16)regval;
 		break;
 	case POWER_SUPPLY_PROP_CURRENT_NOW:
-		ret = regmap_read(chip->regmap, REG_AVERAGE_CURRENT, &regval);
+		ret = mm8013_read_reg(chip, REG_AVERAGE_CURRENT, &regval);
 		if (ret < 0)
 			return ret;
 
 		val->intval = -1000 * (s16)regval;
 		break;
 	case POWER_SUPPLY_PROP_CYCLE_COUNT:
-		ret = regmap_read(chip->regmap, REG_CYCLE_COUNT, &regval);
+		ret = mm8013_read_reg(chip, REG_CYCLE_COUNT, &regval);
 		if (ret < 0)
 			return ret;
 
 		val->intval = regval;
 		break;
 	case POWER_SUPPLY_PROP_HEALTH:
-		ret = regmap_read(chip->regmap, REG_FLAGS, &regval);
+		ret = mm8013_read_reg(chip, REG_FLAGS, &regval);
 		if (ret < 0)
 			return ret;
 
@@ -163,14 +197,14 @@ static int mm8013_get_property(struct power_supply *psy,
 			val->intval = POWER_SUPPLY_HEALTH_GOOD;
 		break;
 	case POWER_SUPPLY_PROP_PRESENT:
-		ret = regmap_read(chip->regmap, REG_TEMPERATURE, &regval);
+		ret = mm8013_read_reg(chip, REG_TEMPERATURE, &regval);
 		if (ret < 0)
 			return ret;
 
 		val->intval = ((s16)regval > 0);
 		break;
 	case POWER_SUPPLY_PROP_STATUS:
-		ret = regmap_read(chip->regmap, REG_FLAGS, &regval);
+		ret = mm8013_read_reg(chip, REG_FLAGS, &regval);
 		if (ret < 0)
 			return ret;
 
@@ -186,14 +220,14 @@ static int mm8013_get_property(struct power_supply *psy,
 			val->intval = POWER_SUPPLY_STATUS_UNKNOWN;
 		break;
 	case POWER_SUPPLY_PROP_TEMP:
-		ret = regmap_read(chip->regmap, REG_TEMPERATURE, &regval);
+		ret = mm8013_read_reg(chip, REG_TEMPERATURE, &regval);
 		if (ret < 0)
 			return ret;
 
 		val->intval = DECIKELVIN_TO_DECIDEGC(regval);
 		break;
 	case POWER_SUPPLY_PROP_TIME_TO_EMPTY_AVG:
-		ret = regmap_read(chip->regmap, REG_AVERAGE_TIME_TO_EMPTY, &regval);
+		ret = mm8013_read_reg(chip, REG_AVERAGE_TIME_TO_EMPTY, &regval);
 		if (ret < 0)
 			return ret;
 
@@ -204,7 +238,7 @@ static int mm8013_get_property(struct power_supply *psy,
 		val->intval = regval;
 		break;
 	case POWER_SUPPLY_PROP_TIME_TO_FULL_AVG:
-		ret = regmap_read(chip->regmap, REG_AVERAGE_TIME_TO_FULL, &regval);
+		ret = mm8013_read_reg(chip, REG_AVERAGE_TIME_TO_FULL, &regval);
 		if (ret < 0)
 			return ret;
 
@@ -215,7 +249,7 @@ static int mm8013_get_property(struct power_supply *psy,
 		val->intval = regval;
 		break;
 	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
-		ret = regmap_read(chip->regmap, REG_VOLTAGE, &regval);
+		ret = mm8013_read_reg(chip, REG_VOLTAGE, &regval);
 		if (ret < 0)
 			return ret;
 
@@ -229,20 +263,11 @@ static int mm8013_get_property(struct power_supply *psy,
 }
 
 static const struct power_supply_desc mm8013_desc = {
-	.name			= "mm8013",
+	.name			= "battery",
 	.type			= POWER_SUPPLY_TYPE_BATTERY,
 	.properties		= mm8013_battery_props,
 	.num_properties		= ARRAY_SIZE(mm8013_battery_props),
 	.get_property		= mm8013_get_property,
-};
-
-static const struct regmap_config mm8013_regmap_config = {
-	.reg_bits = 8,
-	.val_bits = 16,
-	.max_register = 0x68,
-	.use_single_read = true,
-	.use_single_write = true,
-	.val_format_endian = REGMAP_ENDIAN_LITTLE,
 };
 
 static int mm8013_probe(struct i2c_client *client)
@@ -253,21 +278,17 @@ static int mm8013_probe(struct i2c_client *client)
 	struct mm8013_chip *chip;
 	int ret = 0;
 
-	if (!i2c_check_functionality(client->adapter, I2C_FUNC_SMBUS_WORD_DATA))
+	if (!i2c_check_functionality(client->adapter,
+					     I2C_FUNC_SMBUS_BYTE_DATA |
+					     I2C_FUNC_SMBUS_WORD_DATA))
 		return dev_err_probe(dev, -EIO,
-				     "I2C_FUNC_SMBUS_WORD_DATA not supported\n");
+				     "I2C_FUNC_SMBUS_BYTE/WORD_DATA not supported\n");
 
 	chip = devm_kzalloc(dev, sizeof(struct mm8013_chip), GFP_KERNEL);
 	if (!chip)
 		return -ENOMEM;
 
 	chip->client = client;
-
-	chip->regmap = devm_regmap_init_i2c(client, &mm8013_regmap_config);
-	if (IS_ERR(chip->regmap)) {
-		ret = PTR_ERR(chip->regmap);
-		return dev_err_probe(dev, ret, "Couldn't initialize regmap\n");
-	}
 
 	ret = mm8013_checkdevice(chip);
 	if (ret)

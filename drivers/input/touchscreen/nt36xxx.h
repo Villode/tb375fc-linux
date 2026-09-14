@@ -70,8 +70,8 @@
 
 
 /* ---Touch info.--- */
-#define TOUCH_DEFAULT_MAX_WIDTH		1080
-#define TOUCH_DEFAULT_MAX_HEIGHT	2460
+#define TOUCH_DEFAULT_MAX_WIDTH		1840
+#define TOUCH_DEFAULT_MAX_HEIGHT	2944
 #define TOUCH_MAX_FINGER_NUM		10
 #define TOUCH_KEY_NUM				0
 #define TOUCH_FORCE_NUM				1000
@@ -91,14 +91,28 @@
 #define PACKET_PALM_OFF							4
 
 #define BOOT_UPDATE_FIRMWARE					1
-#define DEFAULT_BOOT_UPDATE_FIRMWARE_FIRST		"novatek_nt36672e_l16_fw01.bin"
-#define DEFAULT_MP_UPDATE_FIRMWARE_FIRST		"novatek_nt36672e_l16_mp01.bin"
-#define DEFAULT_BOOT_UPDATE_FIRMWARE_SECOND		"novatek_nt36672e_l16_fw02.bin"
-#define DEFAULT_MP_UPDATE_FIRMWARE_SECOND		"novatek_nt36672e_l16_mp02.bin"
+
+/*
+ * ★ TB375FC 的真固件（2026-09-12 修正）
+ * 来源：PixelOS 设备树
+ *   vendor/lenovo/TB375FC/proprietary/vendor/firmware/novatek_ts_{fw,mp}_{boe,tm}.bin
+ *   （各 245760 字节，device.mk 里被拷进 vendor_ramdisk:/vendor/firmware/）
+ *
+ * 本机面板 compatible = "boe,nt36532,dsi,vdo" ⇒ BOE 优先，天马(tm) 兜底。
+ *
+ * ⚠ 此前这里写的是 novatek_nt36672e_l16_*.bin —— 那是 NT36672E（jdi nt36672e 面板）
+ *   系列的固件，与本设备的 NT36532（级联）并非同一颗 IC。config_array_size=0 时
+ *   nvt_get_panel_type() 必返回 -EINVAL，正好落到这条 default 分支 ⇒ 会拿错误的
+ *   固件去刷一颗未知的芯片。现已替换为正确的 BOE/TM 固件名。
+ */
+#define DEFAULT_BOOT_UPDATE_FIRMWARE_FIRST		"novatek_ts_fw_boe.bin"
+#define DEFAULT_MP_UPDATE_FIRMWARE_FIRST		"novatek_ts_mp_boe.bin"
+#define DEFAULT_BOOT_UPDATE_FIRMWARE_SECOND		"novatek_ts_fw_tm.bin"
+#define DEFAULT_MP_UPDATE_FIRMWARE_SECOND		"novatek_ts_mp_tm.bin"
 #define DEFAULT_DEBUG_FW_NAME					"novatek_debug_fw.bin"
 #define DEFAULT_DEBUG_MP_NAME					"novatek_debug_mp.bin"
 #define MAX_CMDLINE_PARAM_LEN 512
-#define POINT_DATA_CHECKSUM						1
+#define POINT_DATA_CHECKSUM						0
 
 #define NVT_SUPER_RESOLUTION_10S                                        10
 #if NVT_SUPER_RESOLUTION_10S
@@ -182,6 +196,9 @@ struct nvt_ts_data {
 	int panel_index;
 	const u8 *fw_name;
 	const u8 *mp_name;
+	/* DT 覆盖：novatek,fw-name / novatek,mp-name。设了就优先于上面的自动匹配 */
+	const char *dt_fw_name;
+	const char *dt_mp_name;
 	uint32_t spi_max_freq;
 	struct attribute_group *attrs;
 	/*bit map indicate which slot(0~9) has been used*/
@@ -207,7 +224,16 @@ struct nvt_ts_data {
 #endif
 	struct work_struct power_supply_work;
 	struct workqueue_struct *ts_workqueue;
+	struct delayed_work poll_work;
 	bool charger_mode;
+	bool fw_ready;
+	/*
+	 * chip_verified: 三个 trim 地址里至少有一个读回了表内的有效 chip ID。
+	 * fw_update_allowed: 只有在 chip_verified（或显式 force）为真时才允许写 flash，
+	 *                    否则 SPI 读到全 0 也会“probe 成功”，进而给未知芯片刷错固件。
+	 */
+	bool chip_verified;
+	bool fw_update_allowed;
 	struct workqueue_struct *selftest_wq;
 	struct work_struct shorttest_work;
 	struct work_struct opentest_work;
@@ -242,7 +268,7 @@ typedef enum {
 	EVENT_MAP_HANDSHAKING_or_SUB_CMD_BYTE	= 0x51,
 	EVENT_MAP_RESET_COMPLETE				= 0x60,
 	EVENT_MAP_FWINFO						= 0x78,
-	EVENT_MAP_PROJECTID						= 0x9A,
+	EVENT_MAP_PROJECTID						= 0x7A,   /* vendor nt36532.ko reads +0x7A */
 } SPI_EVENT_MAP;
 
 /* ---SPI READ/WRITE--- */
@@ -270,6 +296,7 @@ extern struct nvt_ts_data *ts;
 /*---extern functions---*/
 
 int32_t CTP_SPI_READ(struct spi_device *client, uint8_t *buf, uint16_t len);
+void nvt_dump_bld_bank(const char *tag);
 int32_t CTP_SPI_WRITE(struct spi_device *client, uint8_t *buf, uint16_t len);
 void nvt_bootloader_reset(void);
 void nvt_eng_reset(void);
@@ -282,6 +309,9 @@ int nvt_short_test(void);
 int nvt_open_test(void);
 int32_t nvt_update_firmware(const char *firmware_name);
 int32_t nvt_check_fw_reset_state(RST_COMPLETE_STATE check_reset_state);
+int32_t nvt_change_mode(uint8_t mode);
+void nvt_tp_reset_raw(int level);
+void nvt_touch_reset_and_eng_reset(void);
 int32_t nvt_get_fw_info(void);
 int32_t nvt_clear_fw_status(void);
 int32_t nvt_check_fw_status(void);

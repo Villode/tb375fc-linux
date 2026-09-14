@@ -15,7 +15,7 @@
  * more details.
  *
  */
-#define CHIP_VER_TRIM_ADDR 0x3F004
+#define CHIP_VER_TRIM_ADDR 0x1FB104
 #define CHIP_VER_TRIM_OLD_ADDR 0x1F64E
 
 struct nvt_ts_mem_map {
@@ -34,10 +34,32 @@ struct nvt_ts_mem_map {
 	uint32_t RW_FLASH_DATA_ADDR;
 	uint32_t MMAP_HISTORY_EVENT0;
 	uint32_t MMAP_HISTORY_EVENT1;
-
+	uint32_t MMAP_PIPE0_ADDR;
+	uint32_t MMAP_PIPE1_ADDR;
+	uint32_t MMAP_PIPE2_ADDR;
+	uint32_t MMAP_PIPE3_ADDR;
+	uint32_t MMAP_SLV_RAW_PIPE0_ADDR;
+	uint32_t MMAP_SLV_RAW_PIPE1_ADDR;
+	uint32_t MMAP_SLV_RAW_PIPE2_ADDR;
+	uint32_t MMAP_SLV_RAW_PIPE3_ADDR;
+	uint32_t MMAP_SLV_DIFF_PIPE0_ADDR;
+	uint32_t MMAP_SLV_DIFF_PIPE1_ADDR;
+	uint32_t MMAP_SLV_DIFF_PIPE2_ADDR;
+	uint32_t MMAP_SLV_DIFF_PIPE3_ADDR;
+	uint32_t MMAP_RESERVED_27;
+	uint32_t MMAP_RESERVED_28;
+	uint32_t MMAP_HISTORY_EVENT2;
+	uint32_t MMAP_HISTORY_EVENT3;
+	uint32_t MMAP_HISTORY_EVENT4;
+	uint32_t MMAP_HISTORY_EVENT5;
+	uint32_t MMAP_RESERVED_33;
+	uint32_t MMAP_RESERVED_34;
 	/* Phase 2 Host Download */
 	uint32_t BOOT_RDY_ADDR;
 	uint32_t POR_CD_ADDR;
+	uint32_t MMAP_RESERVED_37;
+	uint32_t CP_TP_CPU_REQ;
+	uint32_t CP_TP_CPU_REQ2;
 	/* BLD CRC */
 	uint32_t BLD_LENGTH_ADDR;
 	uint32_t ILM_LENGTH_ADDR;
@@ -50,9 +72,10 @@ struct nvt_ts_mem_map {
 	uint32_t R_ILM_CHECKSUM_ADDR;
 	uint32_t R_DLM_CHECKSUM_ADDR;
 	uint32_t BLD_CRC_EN_ADDR;
-	uint32_t DMA_CRC_EN_ADDR;
 	uint32_t BLD_ILM_DLM_CRC_ADDR;
 	uint32_t DMA_CRC_FLAG_ADDR;
+	uint32_t DMA_CRC_EN_ADDR;
+	/* FFM / Misc for other ICs */
 	uint32_t FFM2CPU_CTL;
 	uint32_t F2C_LENGTH;
 	uint32_t CPU_IF_ADDR_LOW;
@@ -60,7 +83,6 @@ struct nvt_ts_mem_map {
 	uint32_t FFM_ADDR_LOW;
 	uint32_t FFM_ADDR_MID;
 	uint32_t FFM_ADDR_HIGH;
-	uint32_t CP_TP_CPU_REQ;
 	uint32_t FW_HISTORY_ADDR;
 };
 
@@ -211,6 +233,81 @@ static const struct nvt_ts_mem_map NT36772_memory_map = {
 	.R_ILM_CHECKSUM_ADDR      = 0x1BF00,
 };
 
+static const struct nvt_ts_mem_map NT36532_memory_map = {
+	/*
+	 * NT36532 cascade map - regenerated 2026-09-14 straight from the vendor
+	 * nt36532.ko: .rodata+0x8D8 (NT36532_cascade_memory_map), 62 fields.
+	 * The previous table only matched the trailing BLD-CRC block; fields
+	 * #1..#26 came from a different panel and the last 8 were zero.
+	 */
+	.EVENT_BUF_ADDR           = 0x125800,
+	.RAW_PIPE0_ADDR           = 0x10B200,
+	.RAW_PIPE1_ADDR           = 0x10B200,
+	.BASELINE_ADDR            = 0x109E00,
+	.BASELINE_BTN_ADDR        = 0x0,
+	.DIFF_PIPE0_ADDR          = 0x128140,
+	.DIFF_PIPE1_ADDR          = 0x129540,
+	.RAW_BTN_PIPE0_ADDR       = 0x0,
+	.RAW_BTN_PIPE1_ADDR       = 0x0,
+	.DIFF_BTN_PIPE0_ADDR      = 0x0,
+	.DIFF_BTN_PIPE1_ADDR      = 0x0,
+	.READ_FLASH_CHECKSUM_ADDR = 0x10F940,
+	.RW_FLASH_DATA_ADDR       = 0x10FD40,
+	.MMAP_HISTORY_EVENT0      = 0x110140,
+	.MMAP_HISTORY_EVENT1      = 0x110540,
+	.MMAP_PIPE0_ADDR          = 0x111140,
+	.MMAP_PIPE1_ADDR          = 0x111540,
+	.MMAP_PIPE2_ADDR          = 0x111940,
+	.MMAP_PIPE3_ADDR          = 0x111D40,
+	.MMAP_SLV_RAW_PIPE0_ADDR  = 0x126E00,
+	.MMAP_SLV_RAW_PIPE1_ADDR  = 0x127210,
+	.MMAP_SLV_RAW_PIPE2_ADDR  = 0x127620,
+	.MMAP_SLV_RAW_PIPE3_ADDR  = 0x127A30,
+	.MMAP_SLV_DIFF_PIPE0_ADDR = 0x127E40,
+	.MMAP_SLV_DIFF_PIPE1_ADDR = 0x127EC0,
+	.MMAP_SLV_DIFF_PIPE2_ADDR = 0x127F40,
+	.MMAP_SLV_DIFF_PIPE3_ADDR = 0x127FC0,
+	.MMAP_RESERVED_27         = 0x1FB12C,
+	.MMAP_RESERVED_28         = 0x1,
+	.MMAP_HISTORY_EVENT2      = 0x121AFC,
+	.MMAP_HISTORY_EVENT3      = 0x121B3C,
+	.MMAP_HISTORY_EVENT4      = 0x121B80,
+	.MMAP_HISTORY_EVENT5      = 0x121BC0,
+	.MMAP_RESERVED_33         = 0x0,
+	.MMAP_RESERVED_34         = 0x0,
+	.BOOT_RDY_ADDR            = 0x1FB50D,
+	.POR_CD_ADDR              = 0x1FB605,
+	.MMAP_RESERVED_37         = 0x0,
+	.CP_TP_CPU_REQ            = 0x1FC925,
+	.CP_TP_CPU_REQ2           = 0x1FC914,
+	.BLD_LENGTH_ADDR          = 0x1FB538,
+	.ILM_LENGTH_ADDR          = 0x1FB518,
+	.DLM_LENGTH_ADDR          = 0x1FB530,
+	.BLD_DES_ADDR             = 0x1FB514,
+	.ILM_DES_ADDR             = 0x1FB528,
+	.DLM_DES_ADDR             = 0x1FB52C,
+	.G_ILM_CHECKSUM_ADDR      = 0x1FB500,
+	.G_DLM_CHECKSUM_ADDR      = 0x1FB504,
+	.R_ILM_CHECKSUM_ADDR      = 0x1FB520,
+	.R_DLM_CHECKSUM_ADDR      = 0x1FB524,
+	.BLD_CRC_EN_ADDR          = 0x1FB536,
+	.BLD_ILM_DLM_CRC_ADDR     = 0x1FB533,
+	.DMA_CRC_FLAG_ADDR        = 0x1FB534,
+	.DMA_CRC_EN_ADDR          = 0x0,
+	.FFM2CPU_CTL              = 0x2FD00,
+	.F2C_LENGTH               = 0x30FA0,
+	.CPU_IF_ADDR_LOW          = 0x30FA0,
+	.CPU_IF_ADDR_HIGH         = 0x36510,
+	.FFM_ADDR_LOW             = 0x0,
+	.FFM_ADDR_MID             = 0x373E8,
+	.FFM_ADDR_HIGH            = 0x38068,
+	.FW_HISTORY_ADDR          = 0x0,
+};
+static struct nvt_ts_hw_info NT36532_hw_info = {
+	.carrier_system = 2,
+	.hw_crc         = 2,
+};
+
 static const struct nvt_ts_mem_map NT36525_memory_map = {
 	.EVENT_BUF_ADDR           = 0x11A00,
 	.RAW_PIPE0_ADDR           = 0x10000,
@@ -298,6 +395,9 @@ struct nvt_ts_trim_id_table {
 };
 
 static const struct nvt_ts_trim_id_table trim_id_table[] = {
+	{.id = {0xFF, 0xFF, 0xFF, 0x32, 0x65, 0x03}, .mask = {0, 0, 0, 1, 1, 1},
+		.mmap = &NT36532_memory_map,  .hwinfo = &NT36532_hw_info},
+
 	{.id = {0x0D, 0xFF, 0xFF, 0x72, 0x66, 0x03}, .mask = {1, 0, 0, 1, 1, 1},
 		.mmap = &NT36675_memory_map,  .hwinfo = &NT36675_hw_info},
 	{.id = {0x20, 0xFF, 0xFF, 0x72, 0x66, 0x03}, .mask = {1, 0, 0, 1, 1, 1},

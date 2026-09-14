@@ -581,7 +581,7 @@ static int mtk_xsphy_probe(struct platform_device *pdev)
 		phy_set_drvdata(phy, inst);
 		port++;
 
-		inst->ref_clk = devm_clk_get(&phy->dev, "ref");
+		inst->ref_clk = devm_clk_get_optional(&phy->dev, "ref");
 		if (IS_ERR(inst->ref_clk)) {
 			dev_err(dev, "failed to get ref_clk(id-%d)\n", port);
 			return PTR_ERR(inst->ref_clk);

@@ -228,10 +228,19 @@ static const struct mtk_spi_compatible mt6991_compat = {
 	.ipm_design = true,
 };
 
-static const struct mtk_spi_compatible mt6983_compat = {
-	.need_pad_sel = true,
+static const struct mtk_spi_compatible mt6985_compat = {
+	.must_tx = true,
 	.enhance_timing = true,
 	.dma_ext = true,
+	.no_need_unprepare = true,
+	.ipm_design = true,
+};
+
+static const struct mtk_spi_compatible mt6983_compat = {
+	.must_tx = true,
+	.enhance_timing = true,
+	.dma_ext = true,
+	.no_need_unprepare = true,
 	.ipm_design = true,
 };
 
@@ -262,6 +271,9 @@ static const struct of_device_id mtk_spi_of_match[] = {
 	},
 	{ .compatible = "mediatek,mt6991-spi",
 		.data = (void *)&mt6991_compat,
+	},
+	{ .compatible = "mediatek,mt6985-spi",
+		.data = (void *)&mt6985_compat,
 	},
 	{ .compatible = "mediatek,mt6983-spi",
 		.data = (void *)&mt6983_compat,
@@ -451,20 +463,18 @@ static int mtk_spi_hw_init(struct spi_controller *host,
 		       mdata->base + SPI_PAD_SEL_REG);
 
 	/* tick delay */
-	if (mdata->dev_comp->enhance_timing) {
-		if (mdata->dev_comp->ipm_design) {
-			reg_val = readl(mdata->base + SPI_CMD_REG);
-			reg_val &= ~SPI_CMD_IPM_GET_TICKDLY_MASK;
-			reg_val |= ((chip_config->tick_delay & 0x7)
-				    << SPI_CMD_IPM_GET_TICKDLY_OFFSET);
-			writel(reg_val, mdata->base + SPI_CMD_REG);
-		} else {
-			reg_val = readl(mdata->base + SPI_CFG1_REG);
-			reg_val &= ~SPI_CFG1_GET_TICK_DLY_MASK;
-			reg_val |= ((chip_config->tick_delay & 0x7)
-				    << SPI_CFG1_GET_TICK_DLY_OFFSET);
-			writel(reg_val, mdata->base + SPI_CFG1_REG);
-		}
+	if (mdata->dev_comp->ipm_design) {
+		reg_val = readl(mdata->base + SPI_CMD_REG);
+		reg_val &= ~SPI_CMD_IPM_GET_TICKDLY_MASK;
+		reg_val |= ((chip_config->tick_delay & 0x7)
+			    << SPI_CMD_IPM_GET_TICKDLY_OFFSET);
+		writel(reg_val, mdata->base + SPI_CMD_REG);
+	} else if (mdata->dev_comp->enhance_timing) {
+		reg_val = readl(mdata->base + SPI_CFG1_REG);
+		reg_val &= ~SPI_CFG1_GET_TICK_DLY_MASK;
+		reg_val |= ((chip_config->tick_delay & 0x7)
+			    << SPI_CFG1_GET_TICK_DLY_OFFSET);
+		writel(reg_val, mdata->base + SPI_CFG1_REG);
 	} else {
 		reg_val = readl(mdata->base + SPI_CFG1_REG);
 		reg_val &= ~SPI_CFG1_GET_TICK_DLY_MASK_V1;
@@ -493,6 +503,40 @@ static int mtk_spi_unprepare_message(struct spi_controller *host,
 	return 0;
 }
 
+/*
+ * CS 控制回到主线行为（2026-09-12）。
+ *
+ * 此前这里被改写成操纵 SPI_CMD_CS_POL(bit7) —— 对 active-low 器件，在「撤销片选」
+ * 分支把极性位置 1 会让 CS 引脚在事务之间停在低电平，等于永远保持选中；
+ * Novatek 的协议靠 CS 上升沿来界定帧，CS 不释放时从机不会回数据，
+ * 与实测「写真实数据、读回全 0」的症状完全吻合。该改动也没有带来任何观测收益
+ * （内部回环不经过 pad，看不出差别），因此回退，并通过 spi->mode / SPI_CS_HIGH
+ * 走 hw_init 里的标准极性配置。
+ */
+static void mtk_nvt_manual_cs(struct spi_device *spi, bool asserted)
+{
+	void __iomem *g; u32 v;
+	if (!spi->dev.of_node || !of_device_is_compatible(spi->dev.of_node, "novatek,NVT-ts-spi"))
+		return;
+	g = ioremap(0x10005000, 0x1000);
+	if (!g) return;
+	/* GPIO12 mode nibble is bits 0..3 in MODE register 0x320. */
+	v = readl(g + 0x320);
+	v &= ~0xf;
+	if (asserted) {
+		/* vendor nt36532_spi_cs_low: GPIO output low */
+		writel(v, g + 0x320);
+		v = readl(g + 0x100);
+		v &= ~(1 << 12);
+		writel(v, g + 0x100);
+	} else {
+		/* vendor nt36532_spi_cs_high: return GPIO12 to SPI mode 1 */
+		v |= 1;
+		writel(v, g + 0x320);
+	}
+	iounmap(g);
+}
+
 static void mtk_spi_set_cs(struct spi_device *spi, bool enable)
 {
 	u32 reg_val;
@@ -500,6 +544,7 @@ static void mtk_spi_set_cs(struct spi_device *spi, bool enable)
 
 	if (spi->mode & SPI_CS_HIGH)
 		enable = !enable;
+
 
 	reg_val = readl(mdata->base + SPI_CMD_REG);
 	if (!enable) {
@@ -788,9 +833,36 @@ static bool mtk_spi_can_dma(struct spi_controller *host,
 static int mtk_spi_setup(struct spi_device *spi)
 {
 	struct mtk_spi *mdata = spi_controller_get_devdata(spi->controller);
+	struct mtk_chip_config *chip_config;
+	u32 tick_delay = 0;
+	u32 sample_sel = 0;
 
-	if (!spi->controller_data)
-		spi->controller_data = (void *)&mtk_default_chip_info;
+	if (!spi->controller_data) {
+		chip_config = devm_kzalloc(&spi->controller->dev, sizeof(*chip_config), GFP_KERNEL);
+		if (!chip_config)
+			return -ENOMEM;
+		spi->controller_data = chip_config;
+	} else {
+		chip_config = spi->controller_data;
+	}
+
+	if (!chip_config->tick_delay) {
+		if (!of_property_read_u32_index(spi->controller->dev.of_node,
+						"mediatek,tickdly", spi_get_chipselect(spi, 0),
+						&tick_delay)) {
+			chip_config->tick_delay = tick_delay;
+		} else if (mdata->dev_comp->ipm_design) {
+			chip_config->tick_delay = 3; /* Stock MediaTek IPM timing default */
+		}
+	}
+
+	if (!of_property_read_u32(spi->controller->dev.of_node,
+				  "mediatek,sample-sel", &sample_sel)) {
+		chip_config->sample_sel = sample_sel;
+	}
+
+	dev_info(&spi->dev, "mtk_spi_setup: cs=%d, tick_delay=%u, sample_sel=%u\n",
+		 spi_get_chipselect(spi, 0), chip_config->tick_delay, chip_config->sample_sel);
 
 	if (mdata->dev_comp->need_pad_sel && spi_get_csgpiod(spi, 0))
 		/* CS de-asserted, gpiolib will handle inversion */
@@ -1264,26 +1336,27 @@ static int mtk_spi_probe(struct platform_device *pdev)
 	else
 		dma_set_max_seg_size(dev, SZ_256K);
 
-	mdata->parent_clk = devm_clk_get(dev, "parent-clk");
+	mdata->parent_clk = devm_clk_get_optional(dev, "parent-clk");
 	if (IS_ERR(mdata->parent_clk))
-		return dev_err_probe(dev, PTR_ERR(mdata->parent_clk),
-				     "failed to get parent-clk\n");
+		mdata->parent_clk = NULL;
 
-	mdata->sel_clk = devm_clk_get(dev, "sel-clk");
+	mdata->sel_clk = devm_clk_get_optional(dev, "sel-clk");
 	if (IS_ERR(mdata->sel_clk))
-		return dev_err_probe(dev, PTR_ERR(mdata->sel_clk), "failed to get sel-clk\n");
+		mdata->sel_clk = NULL;
 
-	mdata->spi_clk = devm_clk_get(dev, "spi-clk");
+	mdata->spi_clk = devm_clk_get_optional(dev, "spi-clk");
 	if (IS_ERR(mdata->spi_clk))
-		return dev_err_probe(dev, PTR_ERR(mdata->spi_clk), "failed to get spi-clk\n");
+		mdata->spi_clk = NULL;
 
 	mdata->spi_hclk = devm_clk_get_optional(dev, "hclk");
 	if (IS_ERR(mdata->spi_hclk))
-		return dev_err_probe(dev, PTR_ERR(mdata->spi_hclk), "failed to get hclk\n");
+		mdata->spi_hclk = NULL;
 
-	ret = clk_set_parent(mdata->sel_clk, mdata->parent_clk);
-	if (ret < 0 && ret != -EINVAL)
-		return dev_err_probe(dev, ret, "failed to clk_set_parent\n");
+	if (mdata->sel_clk && mdata->parent_clk) {
+		ret = clk_set_parent(mdata->sel_clk, mdata->parent_clk);
+		if (ret < 0 && ret != -EINVAL)
+			return dev_err_probe(dev, ret, "failed to clk_set_parent\n");
+	}
 	/*
 	 * xaga: LK pre-configures the SPI_SEL mux and leaves SPI2 running,
 	 * and our embedded DTS uses fixed-clock stubs for the mux input, so
@@ -1300,7 +1373,25 @@ static int mtk_spi_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, ret, "failed to enable spi_clk\n");
 	}
 
-	mdata->spi_clk_hz = clk_get_rate(mdata->spi_clk);
+	/*
+	 * spi_clk 缺失时不再静默猜一个 100 MHz：所有分频都按这个数算，
+	 * 猜错会让 SCLK 完全跑偏且毫无征兆。这里显式告警，并优先退化到 parent 的速率。
+	 */
+	if (mdata->spi_clk)
+		mdata->spi_clk_hz = clk_get_rate(mdata->spi_clk);
+	else
+		mdata->spi_clk_hz = 0;
+
+	if (!mdata->spi_clk_hz) {
+		if (mdata->sel_clk)
+			mdata->spi_clk_hz = clk_get_rate(mdata->sel_clk);
+		if (!mdata->spi_clk_hz)
+			mdata->spi_clk_hz = 100000000;
+
+		dev_warn(dev, "no usable \"spi-clk\" rate from DT, assuming %u Hz - "
+			      "SCLK will be wrong unless the module clock really runs at this rate\n",
+			 mdata->spi_clk_hz);
+	}
 
 	if (mdata->dev_comp->no_need_unprepare) {
 		clk_disable(mdata->spi_clk);

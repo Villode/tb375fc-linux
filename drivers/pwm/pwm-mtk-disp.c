@@ -257,6 +257,19 @@ static int mtk_disp_pwm_probe(struct platform_device *pdev)
 
 	chip->ops = &mtk_disp_pwm_ops;
 
+	/* TB375FC: Configure GPIO 131 to Function 1 (DISP_PWM0) */
+	{
+		void __iomem *pio = ioremap(0x10005000, 0x1000);
+		if (pio) {
+			u32 val = readl(pio + 0x0400);
+			val &= ~(0xf << 12);
+			val |= (1 << 12);
+			writel(val, pio + 0x0400);
+			iounmap(pio);
+			dev_info(&pdev->dev, "TB375FC: GPIO 131 configured to Mode 1 (DISP_PWM0)\n");
+		}
+	}
+
 	ret = devm_pwmchip_add(&pdev->dev, chip);
 	if (ret < 0)
 		return dev_err_probe(&pdev->dev, ret, "pwmchip_add() failed\n");
@@ -299,6 +312,7 @@ static const struct of_device_id mtk_disp_pwm_of_match[] = {
 	{ .compatible = "mediatek,mt6595-disp-pwm", .data = &mt8173_pwm_data},
 	{ .compatible = "mediatek,mt8173-disp-pwm", .data = &mt8173_pwm_data},
 	{ .compatible = "mediatek,mt8183-disp-pwm", .data = &mt8183_pwm_data},
+	{ .compatible = "mediatek,mt6897-disp-pwm", .data = &mt8183_pwm_data},
 	{ }
 };
 MODULE_DEVICE_TABLE(of, mtk_disp_pwm_of_match);

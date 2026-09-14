@@ -82,9 +82,10 @@ $(obj)/vdso32-wrap.o: $(obj)/vdso32/vdso.so
 # .dtb.init.rodata section) so initial_boot_params stays valid after boot.
 obj-$(CONFIG_OF) += xaga-dtb.o
 # Build the board DTB through the normal DT build machinery before wrapping it.
-$(srctree)/arch/arm64/boot/dts/mediatek/mt6895-xiaomi-xaga.dtb: FORCE
-	$(Q)$(MAKE) -C $(srctree) ARCH=arm64 LLVM=1 mediatek/mt6895-xiaomi-xaga.dtb
-$(obj)/xaga-dtb.o: $(srctree)/arch/arm64/boot/dts/mediatek/mt6895-xiaomi-xaga.dtb FORCE
+# TB375FC: 改用本机 DTB（在 objtree，由 make dtbs 先产出）。
+# 必须相对路径，objcopy 生成的符号才是
+#   _binary_arch_arm64_boot_dts_mediatek_mt6897_lenovo_tb375fc_dtb_start
+$(obj)/xaga-dtb.o: arch/arm64/boot/dts/mediatek/mt6897-lenovo-tb375fc.dtb FORCE
 	$(call if_changed,objcopy)
 OBJCOPYFLAGS_xaga-dtb.o := -I binary -O elf64-littleaarch64 -B aarch64 \
 	--rename-section .data=.rodata,alloc,readonly
