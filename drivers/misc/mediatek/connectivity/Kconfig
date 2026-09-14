@@ -10,6 +10,22 @@ bool "MT6895 Consys support"
 depends on MTK_COMBO
 default y
 
+config MTK_COMBO_CHIP_CONSYS_6897
+bool "MT6897 Consys support"
+depends on MTK_COMBO
+default y
+help
+  TB375FC (MT6897 / MT6898, CONNAC2X2 SOC7_0) consys platform.
+
+config MTK_COMBO_WIFI_6897
+bool "MT6897 Wi-Fi firmware flavour"
+depends on MTK_COMBO_WIFI
+default n
+help
+  Turn on when the device's connsys_wifi partition carries the MT6897
+  (not MT6895) firmware build.  Selects the mediatek/mt6897/ firmware
+  subdirectory in the fullmac driver.
+
 config MTK_COMBO_WIFI
 bool "MT6895 Wi-Fi support"
 depends on MTK_COMBO

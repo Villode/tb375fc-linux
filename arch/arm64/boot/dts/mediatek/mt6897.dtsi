@@ -448,4 +448,121 @@
 			};
 		};
 	};
+
+	/* ==== 连接性 WiFi/蓝牙：见 kernel/dts/mt6897-connectivity.dtsi ==== */
+	consys: consys@18000000 {
+		compatible = "mediatek,mt6897-consys";
+		#thermal-sensor-cells = <0>;
+		reg = <0x0 0x10001000 0x0 0xf64>,
+		      <0x0 0x10005000 0x0 0xa6c>,
+		      <0x0 0x11ec0000 0x0 0xa04>,
+		      <0x0 0x18000000 0x0 0x480>,
+		      <0x0 0x18001000 0x0 0x658>,
+		      <0x0 0x18003000 0x0 0x204>,
+		      <0x0 0x1800e000 0x0 0x124>,
+		      <0x0 0x18011000 0x0 0x138>,
+		      <0x0 0x18012000 0x0 0xbc>,
+		      <0x0 0x18020000 0x0 0x4c>,
+		      <0x0 0x18023000 0x0 0x1000>,
+		      <0x0 0x1803b000 0x0 0x18>,
+		      <0x0 0x18040000 0x0 0x2c>,
+		      <0x0 0x18041000 0x0 0x164>,
+		      <0x0 0x18042000 0x0 0x324>,
+		      <0x0 0x1804b000 0x0 0x414>,
+		      <0x0 0x1804d000 0x0 0x41c>,
+		      <0x0 0x1804f000 0x0 0x148>,
+		      <0x0 0x18053800 0x0 0x1000>,
+		      <0x0 0x18060000 0x0 0xbf8>,
+		      <0x0 0x18070000 0x0 0x8004>,
+		      <0x0 0x1c001000 0x0 0x1000>,
+		      <0x0 0x1c00a000 0x0 0x51c>,
+		      <0x0 0x1803c000 0x0 0x04>,
+		      <0x0 0x1803e000 0x0 0x04>;
+		emi-addr = <0>;
+		emi-size = <0xc00000>;
+		ro-bt-emi-size = <0x2e0000>;
+		ro-gps-emi-size = <0xa0000>;
+		ro-wifi-emi-size = <0x300000>;
+		ro-emi-size = <0x680000>;
+		rw-emi-size = <0x480000>;
+		emi-alignment = <0x100000>;
+		emi-max-addr = <0x90000000>;
+		tcxo_support = "false";
+		status = "okay";
+	};
+
+	wifi: wifi@18000000 {
+		compatible = "mediatek,wifi";
+		reg = <0x0 0x18000000 0x0 0x700000>;
+		interrupts = <GIC_SPI 889 IRQ_TYPE_LEVEL_HIGH 0>,
+			     <GIC_SPI 613 IRQ_TYPE_LEVEL_HIGH 0>;
+		emi-addr = <0>;
+		emi-size = <0x1400000>;
+		emi-alignment = <0x1000000>;
+		emi-max-addr = <0xc0000000>;
+		status = "okay";
+	};
+
+	/*
+	 * 蓝牙：**没有独立的 btif@1100c000 节点** —— 厂商 DT 里也没有。
+	 * bt/mt66xx 驱动用 USE_DEVICE_NODE=0，自己创建 platform_device，
+	 * 再按 compatible = "mediatek,bt" 找这个节点取寄存器基址
+	 * （见 btmtk_btif_main.c: bt_reg_init()）。
+	 * 7 段 reg 的顺序必须与 CONSYS_BASE_ADDR_MAX 一致，别重排。
+	 */
+	bt: bt@18000000 {
+		compatible = "mediatek,bt";
+		reg = <0x0 0x18000000 0x0 0x1000>,
+		      <0x0 0x18001000 0x0 0x1000>,
+		      <0x0 0x18051000 0x0 0x1000>,
+		      <0x0 0x18060000 0x0 0x1000>,
+		      <0x0 0x18800000 0x0 0x1000>,
+		      <0x0 0x18812000 0x0 0x1000>,
+		      <0x0 0x10001000 0x0 0x1000>;
+		interrupts = <GIC_SPI 892 IRQ_TYPE_LEVEL_HIGH 0>,
+			     <GIC_SPI 614 IRQ_TYPE_LEVEL_HIGH 0>,
+			     <GIC_SPI 891 IRQ_TYPE_LEVEL_HIGH 0>;
+		status = "okay";
+	};
+
+	/* 外置 FEM（前端模组）描述表：只有 vid/pid，实际型号由板子选 */
+	connfem: connfem {
+		compatible = "mediatek,mt6897-connfem";
+		status = "okay";
+
+		nofem: nofem {
+			vid = <0x00>;
+			pid = <0x00>;
+		};
+
+		wlan7207h: wlan7207h {
+			vid = <0x02>;
+			pid = <0x04>;
+		};
+
+		wlan7207c: wlan7207c {
+			vid = <0x02>;
+			pid = <0x07>;
+		};
+
+		qm42195: qm42195 {
+			vid = <0x03>;
+			pid = <0x01>;
+		};
+
+		qm45197: qm45197 {
+			vid = <0x03>;
+			pid = <0x02>;
+		};
+
+		sky85732: sky85732 {
+			vid = <0x01>;
+			pid = <0x03>;
+		};
+
+		vc536411: vc536411 {
+			vid = <0x05>;
+			pid = <0x01>;
+		};
+	};
 };

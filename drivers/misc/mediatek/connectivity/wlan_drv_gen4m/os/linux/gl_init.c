@@ -2465,7 +2465,11 @@ enum ENUM_NVRAM_STATE wlanNvramGetState(void)
 	return g_NvramFsm;
 }
 
+#if IS_ENABLED(CONFIG_MTK_COMBO_WIFI_6897)
+#define XAGA_WIFI_NVRAM_FW "mediatek/mt6897/WIFI"
+#else
 #define XAGA_WIFI_NVRAM_FW "mediatek/mt6895/WIFI"
+#endif
 
 static int wlanLoadNvramFirmware(struct device *dev)
 {

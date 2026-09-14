@@ -173,7 +173,7 @@ else
     ccflags-y += -DCFG_ENABLE_HOST_BUS_TIMEOUT=0
 endif
 
-ifneq ($(filter 6879 6895, $(WLAN_CHIP_ID)),)
+ifneq ($(filter 6879 6895 6897, $(WLAN_CHIP_ID)),)
     ccflags-y += -DCFG_SUPPORT_SET_IPV6_NETWORK=1
 else
     ccflags-y += -DCFG_SUPPORT_SET_IPV6_NETWORK=0
