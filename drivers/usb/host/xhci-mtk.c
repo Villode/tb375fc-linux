@@ -445,7 +445,11 @@ static int xhci_mtk_vregs_get(struct xhci_hcd_mtk *mtk)
 	supplies[0].supply = "vbus";
 	supplies[1].supply = "vusb33";
 
-	return devm_regulator_bulk_get(mtk->dev, BULK_VREGS_NUM, supplies);
+	if (devm_regulator_bulk_get(mtk->dev, BULK_VREGS_NUM, supplies)) {
+		supplies[0].consumer = NULL;
+		supplies[1].consumer = NULL;
+	}
+	return 0;
 }
 
 static void xhci_mtk_quirks(struct device *dev, struct xhci_hcd *xhci)
@@ -575,9 +579,11 @@ static int xhci_mtk_probe(struct platform_device *pdev)
 	pm_runtime_enable(dev);
 	pm_runtime_get_sync(dev);
 
-	ret = regulator_bulk_enable(BULK_VREGS_NUM, mtk->supplies);
-	if (ret)
-		goto disable_pm;
+	if (mtk->supplies[0].consumer) {
+		ret = regulator_bulk_enable(BULK_VREGS_NUM, mtk->supplies);
+		if (ret)
+			goto disable_pm;
+	}
 
 	ret = clk_bulk_prepare_enable(BULK_CLKS_NUM, mtk->clks);
 	if (ret)
@@ -695,7 +701,8 @@ disable_clk:
 	clk_bulk_disable_unprepare(BULK_CLKS_NUM, mtk->clks);
 
 disable_ldos:
-	regulator_bulk_disable(BULK_VREGS_NUM, mtk->supplies);
+	if (mtk->supplies[0].consumer)
+		regulator_bulk_disable(BULK_VREGS_NUM, mtk->supplies);
 
 disable_pm:
 	pm_runtime_put_noidle(dev);
@@ -728,7 +735,8 @@ static void xhci_mtk_remove(struct platform_device *pdev)
 	usb_put_hcd(hcd);
 	xhci_mtk_sch_exit(mtk);
 	clk_bulk_disable_unprepare(BULK_CLKS_NUM, mtk->clks);
-	regulator_bulk_disable(BULK_VREGS_NUM, mtk->supplies);
+	if (mtk->supplies[0].consumer)
+		regulator_bulk_disable(BULK_VREGS_NUM, mtk->supplies);
 
 	pm_runtime_disable(dev);
 	pm_runtime_put_noidle(dev);

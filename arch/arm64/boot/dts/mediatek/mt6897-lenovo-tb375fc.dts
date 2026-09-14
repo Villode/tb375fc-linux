@@ -1,0 +1,413 @@
+// SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+/*
+ * Lenovo TB375FC（MT6897 / MT8792）—— mainline S1 board DTS。
+ *
+ * S1 的目标只有一个：主线内核跑起来，并且**在屏幕上**看到内核日志。
+ * 这台机器没有可用的串口调试口（UART0 走键盘底座），fbcon 是唯一出口。
+ *
+ * 关键事实（来源：reports/porting-facts.md，取自 bootloader 传入的 FDT 与 LK 日志）：
+ *   - 帧缓冲 0xfc16f000，64 MB（LK 的 mblock-alloc + atag,videolfb 两处一致）
+ *   - 面板 2944x1840，bpp=4 → stride 11776
+ *   - /memory 起点 0x40000000，12 GB
+ *   - GIC 0xc000000 + 重分发 0xc400000；BL31 常驻 0x48800000（2 MB，必须保留，
+ *     否则 PSCI（secondary boot / cpuidle）会踩到 ATF）
+ */
+
+/dts-v1/;
+#include "mt6897.dtsi"
+
+/ {
+	model = "Lenovo TB375FC";
+	compatible = "lenovo,tb375fc", "mediatek,mt6897";
+
+	chosen {
+		/*
+		 * LK 会用自己那份 cmdline 覆写 /chosen，所以这条实际多半不生效 ——
+		 * 内核那边用 CONFIG_CMDLINE_FORCE 兜底（见 configs/tb375fc-s1.config）。
+		 */
+		/*
+		 * panic=0 —— **panic 后不重启**，让画面停在死掉那一刻。
+		 * 这是没有串口时最有效的调试手段：刷一次就能把现场读完。
+		 * （代价：需要长按电源键强制重启。）
+		 */
+		bootargs = "console=tty0 ignore_loglevel cpuidle.off=1 clk_ignore_unused panic=0 nt36xxx_ts.accept_unknown_chip=1";
+		stdout-path = &uart0;
+	};
+
+	aliases {
+		serial0 = &uart0;
+	};
+
+	memory@40000000 {
+		device_type = "memory";
+		reg = <0x0 0x40000000 0x3 0x0>;		/* 12 GiB */
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		/* BL31 / ATF：PSCI 的落点，被 Linux 覆盖 = secondary CPU 或 suspend 挂死 */
+		bl31@48800000 {
+			reg = <0x0 0x48800000 0x0 0x200000>;
+			no-map;
+		};
+
+		/*
+		 * LK 留下的扫描输出缓冲。必须 no-map：否则它落在内核 RAM 里，
+		 * simplefb 的 request_mem_region()/ioremap() 会失败，而且内核可能
+		 * 把这块内存拿去用、把 LK 画面写坏。
+		 */
+		framebuffer@fc16f000 {
+			reg = <0x0 0xfc16f000 0x0 0x3e90000>;
+			no-map;
+		};
+
+		/*
+		 * MT6897 硬件/固件保留内存（直接提取自厂商 DTB board.dts）：
+		 * 必须精确 no-map，防止 Linux 将其当普通 RAM 申请并触碰，
+		 * 导致触发 EMI MPU 硬件安全违规、协处理器死锁或总线挂死。
+		 */
+		mblock-34-sspm_ap-shared {
+			reg = <0x0 0x9f06f000 0x0 0x110000>;
+			no-map;
+		};
+
+		mblock-33-platform-debug_slbc_shared {
+			reg = <0x0 0xfc12f000 0x0 0x40000>;
+			no-map;
+		};
+
+		mblock-32-me_GPUEB_SHARED {
+			reg = <0x0 0x7fe70000 0x0 0x180000>;
+			no-map;
+		};
+
+		mblock-31-me_CSFFWLOG_reserved {
+			reg = <0x0 0x7fffb000 0x0 0x4000>;
+			no-map;
+		};
+
+		mblock-30-me_vcp_reserved {
+			reg = <0x0 0xbf600000 0x0 0x800000>;
+			no-map;
+		};
+
+		mblock-29-debug_met_res-ram {
+			reg = <0x0 0x9f17f000 0x0 0xc00000>;
+			no-map;
+		};
+
+		mblock-28-platform-debug_dfdsoc_dump {
+			reg = <0x0 0xf9400000 0x0 0x300000>;
+			no-map;
+		};
+
+		mblock-27-security_tee_ree {
+			reg = <0x3 0x3b400000 0x0 0x2000000>;
+			no-map;
+		};
+
+		mblock-26-security_tee_log {
+			reg = <0x3 0x3d400000 0x0 0x20000>;
+			no-map;
+		};
+
+		mblock-25-tee-reserved {
+			reg = <0x0 0x70000000 0x0 0x5000000>;
+			no-map;
+		};
+
+		mblock-24-tee-secmem {
+			reg = <0x0 0x7f400000 0x0 0x900000>;
+			no-map;
+		};
+
+		mblock-23-MCUPM-reserved {
+			reg = <0x0 0x7fd00000 0x0 0x100000>;
+			no-map;
+		};
+
+		mblock-22-SSPM-reserved {
+			reg = <0x0 0x9fd7f000 0x0 0x280000>;
+			no-map;
+		};
+
+		mblock-21-platform_mtksmmu_protpgd {
+			reg = <0x0 0xf9e00000 0x0 0x2200000>;
+			no-map;
+		};
+
+		mblock-19-unmap2 {
+			reg = <0x3 0x3d800000 0x0 0x200000>;
+			no-map;
+		};
+
+		mblock-18-mkp {
+			reg = <0x3 0x3da00000 0x0 0x200000>;
+			no-map;
+		};
+
+		mblock-17-gz {
+			reg = <0x3 0x3dc00000 0x0 0x2200000>;
+			no-map;
+		};
+
+		mblock-16-me_cmdq_reserved {
+			reg = <0x3 0x3fe00000 0x0 0x100000>;
+			no-map;
+		};
+
+		mblock-14-me_gpu_reserved {
+			reg = <0x0 0x7f200000 0x0 0x200000>;
+			no-map;
+		};
+
+		mblock-13-security_dice_common {
+			reg = <0x0 0x6fffe000 0x0 0x1000>;
+			no-map;
+		};
+
+		mblock-12-atf-log-reserved {
+			reg = <0x0 0xbfe00000 0x0 0x200000>;
+			no-map;
+		};
+
+		mblock-10-emi_mbist_buf {
+			reg = <0x0 0x7ffff000 0x0 0x1000>;
+			no-map;
+		};
+
+		mblock-9-dramc-rk1 {
+			reg = <0x3 0x3fffe000 0x0 0x2000>;
+			no-map;
+		};
+
+		mblock-8-dramc-rk0 {
+			reg = <0x1 0xbfffe000 0x0 0x2000>;
+			no-map;
+		};
+
+		mblock-7-platform-debug_dfdmcu_dump {
+			reg = <0x0 0xf9800000 0x0 0x280000>;
+			no-map;
+		};
+
+		mblock-6-crypto_hw {
+			reg = <0x0 0x48401000 0x0 0x1000>;
+			no-map;
+		};
+
+		mblock-4-BL31-reserved {
+			reg = <0x0 0x48800000 0x0 0x200000>;
+			no-map;
+		};
+
+		mblock-3-minirdump {
+			reg = <0x0 0x48170000 0x0 0x10000>;
+			no-map;
+		};
+
+		mblock-1-aee_debug_kinfo {
+			reg = <0x0 0x48080000 0x0 0x10000>;
+			no-map;
+		};
+
+		/*
+		 * ramoops：把最后一次启动的 console 日志留在内存里。
+		 * 地址/尺寸照抄厂商 cmdline：ramoops.mem_address=0x48090000
+		 * mem_size=0xe0000 console_size=0x40000 pmsg_size=0x80000
+		 * （0x20000 record + 0x40000 console + 0x80000 pmsg = 0xe0000）
+		 *
+		 * 注意：这里**不能** no-map —— 它必须留在普通内存里才能跨重启存活。
+		 * 下次进 recovery（厂商内核也把 ramoops 配在同一地址）读
+		 * /sys/fs/pstore/console-ramoops-0 就能拿到我们的日志。
+		 */
+		ramoops@48090000 {
+			compatible = "ramoops";
+			reg = <0x0 0x48090000 0x0 0xe0000>;
+			record-size = <0x20000>;
+			console-size = <0x40000>;
+			ftrace-size = <0x0>;
+			pmsg-size = <0x80000>;
+		};
+	};
+
+	/*
+	 * 把 stdout 接到 LK 的点亮画面上。放在根节点而不是 /chosen ——
+	 * LK 会重写 /chosen 并丢掉它不认识的属性（xaga 移植踩过这个坑）。
+	 */
+	framebuffer@fc16f000 {
+		compatible = "simple-framebuffer";
+		reg = <0x0 0xfc16f000 0x0 0x3e90000>;
+		width = <2944>;
+		height = <1840>;
+		stride = <11776>;		/* 2944 * 4 */
+		format = "a8r8g8b8";
+	};
+
+	backlight: backlight {
+		compatible = "pwm-backlight";
+		pwms = <&disp_pwm0 0 39380>;
+		brightness-levels = <
+			  0   1   2   3   4   5   6   7   8   9
+			 10  12  14  16  19  22  26  30  35  40
+			 46  53  60  68  77  87  98 110 123 137
+			152 168 185 203 222 242 255
+		>;
+		default-brightness-level = <20>;
+		status = "okay";
+	};
+};
+
+/*
+ * S1 先不开 UART：没有可用的调试口，而 uarthub 的路由主线没有驱动，
+ * 探错了反而可能把键盘底座的 UART 搞乱。留 status = "disabled"。
+ */
+&uart0 {
+	status = "disabled";
+};
+
+/*
+ * ★ 必须开看门狗。LK 起来时就把硬件 RGU 打开了，之后没人喂它就会复位 ——
+ *   这正是我们一直看到「卡一屏 → 重启」、以及 panic=0 也停不住的原因。
+ *   主线 mtk_wdt 驱动 probe 后会接管它；配合
+ *   CONFIG_WATCHDOG_HANDLE_BOOT_ENABLED，内核会自己喂，设备就不会再被复位，
+ *   panic 时的现场才能留在屏幕上。
+ */
+&watchdog {
+	status = "okay";
+};
+
+&ufsphy {
+	status = "okay";
+};
+
+&ufshci {
+	status = "okay";
+};
+
+&u2phy0 {
+	status = "okay";
+};
+
+&ssusb {
+	dr_mode = "peripheral";
+	status = "okay";
+};
+
+&xhci0 {
+	status = "disabled";
+};
+
+
+/*
+ * ★ 触摸：Novatek NT36532，走 SPI2。
+ * 没有 pinctrl 驱动前，引脚复用和电源由内核驱动里的硬编码 GPIO 初始化完成。
+ * IRQ 线是 GPIO 9（厂商 DTBO 实测值；此前误记为 59），无 pinctrl 描述时驱动
+ * fallback 到 100Hz 轮询。
+ *
+ * ★ SPI 模块时钟（2026-09-12 实测修正）：厂商 DTB 为 clock-source-type = "mainpll"，
+ * 用内部回环精确计时反推模块时钟 ≈ 208 MHz。主线暂无 MT6897 topckgen 驱动，
+ * dtsi 里三个时钟全写成 clk26m 占位（26 MHz），而驱动是按 clk_get_rate() 算分频的：
+ *     div = DIV_ROUND_UP(spi_clk_hz, speed_hz);  sck_time = (div + 1) / 2;
+ *     SCLK = f_mod / (2 * sck_time)
+ * 按 26 MHz 算 → div=3, sck_time=2 → CFG2=0x00010001（实测寄存器正是此值），
+ * 真实 SCLK = 208/4 ≈ 52 MHz，是 NT36532 上限 9.6 MHz 的 5.4 倍。
+ * 佐证：同一控制器内部回环在 CFG2=0x00010001 时数据被破坏（a5a5→b4b4），
+ *       在 CFG2=0x000a000a 时完全正确 —— 0x0a 正是 9.6 MHz 目标对应的取值。
+ *
+ * ★ spi-max-frequency = 1 MHz 是刻意保守值（loopback 验证过的安全档）：
+ * 208 MHz 是回环计时反推的估计值，非时钟树确证；按 1 MHz 请求即使 f_mod 有
+ * 数倍偏差，SCLK 仍远低于 NT36532 的 9.6 MHz 上限。代价只是传输慢（本阶段
+ * 已关闭 boot 固件升级，只传小包，无影响）。首触成功后再提到 9.6 MHz。
+ */
+/ {
+	spi_mclk: spi-mclk {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <208000000>;
+	};
+};
+
+&spi2 {
+	clocks = <&clk26m>, <&clk26m>, <&spi_mclk>;
+	clock-names = "parent-clk", "sel-clk", "spi-clk";
+	mediatek,pad-select = <0x00>;
+	mediatek,tickdly = <0x03 0x00>;
+	status = "okay";
+
+	touchscreen@0 {
+		compatible = "novatek,NVT-ts-spi";
+		reg = <0>;
+		spi-max-frequency = <9600000>;   /* = vendor DTBO 0x927c00 (9.6 MHz), NT36532 datasheet max */
+		novatek,reset-gpio = <&pio 60 GPIO_ACTIVE_HIGH>;
+		novatek,irq-gpio = <&pio 9 0x2001>;
+		novatek,pen-support;
+		novatek,stylus-resol-double;
+		novatek,accept-unknown-chip;
+		novatek,fw-name = "novatek_ts_fw_boe.bin";
+		novatek,mp-name = "novatek_ts_mp_boe.bin";
+		touchscreen-size-x = <1840>;
+		touchscreen-size-y = <2944>;
+		status = "okay";
+	};
+};
+
+&disp_pwm0 {
+	status = "okay";
+};
+
+
+
+/*
+ * ================= 电池（2026-09-12）=================
+ * 主线自带 mm8013 电量计驱动（drivers/power/supply/mm8013.c），
+ * 它是**按需读取**的：每次 power_supply 取属性时直接读寄存器，不需要中断。
+ * 所以只要 I2C 通，就能拿到 SOC / 电压 / 电流 / 温度 / 循环次数。
+ *
+ *   电量计  mm8013  @0x55  → i2c7 = 0x11d02000（厂商编号）
+ *   充电 IC mt6375  @0x34  → i2c5 = 0x11f01000（INT = GPIO7 低有效）
+ *
+ * 引脚复用：厂商 DT 里没有这两组 I2C 的 pinmux 组，推断由 LK 配置
+ * （LK 的充电流程本身就要用这两条总线）。若实测不通，再从 recovery 侧
+ * 读 GPIO147/148（i2c5）与 GPIO151/152（i2c7）的 MODE 寄存器补配。
+ */
+&i2c5 {
+	/* 厂商值是 1 MHz；先用 400 kHz 保守值（占位时钟偏大 ⇒ 实际只会更慢） */
+	clock-frequency = <400000>;
+	status = "okay";
+
+	/*
+	 * mt6375：主线有 MFD 驱动（drivers/mfd/mt6375.c），但它必须有 INT 线
+	 * 才能 probe（内部是 IRQ 驱动的 MFD：CHG_IRQ0/PD_EVT 等）。
+	 * 主线还没有 MT6897 的 GPIO/EINT 控制器 ⇒ 中断解析不了，先禁用。
+	 * 另外本树的 MT6375_CHARGER / MT6375_BATTERY 只是孤立 Kconfig，
+	 * 没有实现文件 —— 真要控制充电得自己补驱动（可从厂商 mt6375-charger.ko 反汇编取寄存器）。
+	 */
+	mt6375: charger@34 {
+		compatible = "mediatek,mt6375";
+		reg = <0x34>;
+		interrupt-parent = <&pio>;
+		interrupts = <7 IRQ_TYPE_LEVEL_LOW>;
+		status = "okay";
+	};
+};
+
+&i2c7 {
+	/* 100 kHz：MM8013 读不稳（高字节 0xFF）+ 设置闪退的修复。
+	 * 厂商 DTBO 里该总线也是低速（1MHz 偏快，实测 0xFF 填充）；
+	 * 降到 100 kHz 保证容性负载下数据可靠，后续若稳可回提。 */
+	clock-frequency = <100000>;
+	status = "okay";
+
+	ext_gauge: gauge@55 {
+		compatible = "mitsumi,mm8013";
+		reg = <0x55>;
+		status = "okay";
+	};
+};
+
+/* MT6363 PMIC（SPMI）：等 clk-mt6897 时钟驱动就位后再启用，
+   否则 PMIF 总线第一次访问就会把 CPU 挂死（2026-09-13 实测） */

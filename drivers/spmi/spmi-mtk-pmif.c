@@ -687,8 +687,18 @@ static int mtk_spmi_irq_init(struct device_node *node,
 	pbus->irq = of_irq_get_byname(node, "rcs_irq");
 	if (pbus->irq == -EINVAL || pbus->irq == -ENODATA)
 		pbus->irq = of_irq_get_byname(node, "rcs");
-	if (pbus->irq <= 0)
-		return pbus->irq ? : -ENXIO;
+	if (pbus->irq <= 0) {
+		/*
+		 * xaga: PMIC INT(rcs_irq) 挂在 pinctrl-EINT 上，pinctrl
+		 * 尚未移植时拿不到这条中断。降级为无中断模式继续工作，
+		 * PMIC 侧（keys 等）自会走轮询。
+		 */
+		pr_warn("%pOFn: PMIC INT(rcs_irq) unavailable (%d), continue without irq\n",
+			node, pbus->irq);
+		pbus->irq = 0;
+		pbus->dom = NULL;
+		return 0;
+	}
 
 	pbus->dom = irq_domain_create_tree(of_fwnode_handle(node),
 					   &mtk_spmi_rcs_irq_domain_ops, pbus);
@@ -818,6 +828,13 @@ static int mtk_spmi_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, arb);
 
+	chan_offset = PMIF_CHAN_OFFSET * arb->data->soc_chan;
+	arb->chan.ch_sta = PMIF_SWINF_0_STA + chan_offset;
+	arb->chan.wdata = PMIF_SWINF_0_WDATA_31_0 + chan_offset;
+	arb->chan.rdata = PMIF_SWINF_0_RDATA_31_0 + chan_offset;
+	arb->chan.ch_send = PMIF_SWINF_0_ACC + chan_offset;
+	arb->chan.ch_rdy = PMIF_SWINF_0_VLD_CLR + chan_offset;
+
 	if (!arb->data->num_spmi_buses) {
 		ret = mtk_spmi_bus_probe(pdev, node, arb->data, &arb->bus[cur_bus]);
 		if (ret)
@@ -834,13 +851,6 @@ static int mtk_spmi_probe(struct platform_device *pdev)
 			cur_bus++;
 		}
 	}
-
-	chan_offset = PMIF_CHAN_OFFSET * arb->data->soc_chan;
-	arb->chan.ch_sta = PMIF_SWINF_0_STA + chan_offset;
-	arb->chan.wdata = PMIF_SWINF_0_WDATA_31_0 + chan_offset;
-	arb->chan.rdata = PMIF_SWINF_0_RDATA_31_0 + chan_offset;
-	arb->chan.ch_send = PMIF_SWINF_0_ACC + chan_offset;
-	arb->chan.ch_rdy = PMIF_SWINF_0_VLD_CLR + chan_offset;
 
 	return 0;
 }
@@ -875,6 +885,9 @@ static const struct of_device_id mtk_spmi_match_table[] = {
 		.data = &mt8196_pmif_arb,
 	}, {
 		.compatible = "mediatek,mt6895-spmi",
+		.data = &mt6895_pmif_arb,
+	}, {
+		.compatible = "mediatek,mt6897-spmi",
 		.data = &mt6895_pmif_arb,
 	}, {
 		/* sentinel */

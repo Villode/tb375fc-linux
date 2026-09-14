@@ -132,10 +132,12 @@ static int ssusb_rscs_init(struct ssusb_mtk *ssusb)
 {
 	int ret = 0;
 
-	ret = regulator_enable(ssusb->vusb33);
-	if (ret) {
-		dev_err(ssusb->dev, "failed to enable vusb33\n");
-		goto vusb33_err;
+	if (ssusb->vusb33) {
+		ret = regulator_enable(ssusb->vusb33);
+		if (ret) {
+			dev_err(ssusb->dev, "failed to enable vusb33\n");
+			goto vusb33_err;
+		}
 	}
 
 	ret = clk_bulk_prepare_enable(BULK_CLKS_CNT, ssusb->clks);
@@ -161,7 +163,8 @@ phy_err:
 phy_init_err:
 	clk_bulk_disable_unprepare(BULK_CLKS_CNT, ssusb->clks);
 clks_err:
-	regulator_disable(ssusb->vusb33);
+	if (ssusb->vusb33)
+		regulator_disable(ssusb->vusb33);
 vusb33_err:
 	return ret;
 }
@@ -169,7 +172,8 @@ vusb33_err:
 static void ssusb_rscs_exit(struct ssusb_mtk *ssusb)
 {
 	clk_bulk_disable_unprepare(BULK_CLKS_CNT, ssusb->clks);
-	regulator_disable(ssusb->vusb33);
+	if (ssusb->vusb33)
+		regulator_disable(ssusb->vusb33);
 	ssusb_phy_power_off(ssusb);
 	ssusb_phy_exit(ssusb);
 }
@@ -224,11 +228,9 @@ static int get_ssusb_rscs(struct platform_device *pdev, struct ssusb_mtk *ssusb)
 	int i;
 	int ret;
 
-	ssusb->vusb33 = devm_regulator_get(dev, "vusb33");
-	if (IS_ERR(ssusb->vusb33)) {
-		dev_err(dev, "failed to get vusb33\n");
-		return PTR_ERR(ssusb->vusb33);
-	}
+	ssusb->vusb33 = devm_regulator_get_optional(dev, "vusb33");
+	if (IS_ERR(ssusb->vusb33))
+		ssusb->vusb33 = NULL;
 
 	clks[0].id = "sys_ck";
 	clks[1].id = "ref_ck";
@@ -287,11 +289,9 @@ static int get_ssusb_rscs(struct platform_device *pdev, struct ssusb_mtk *ssusb)
 	of_property_read_u32(node, "mediatek,u2p-dis-msk",
 			     &ssusb->u2p_dis_msk);
 
-	otg_sx->vbus = devm_regulator_get(dev, "vbus");
-	if (IS_ERR(otg_sx->vbus)) {
-		dev_err(dev, "failed to get vbus\n");
-		return PTR_ERR(otg_sx->vbus);
-	}
+	otg_sx->vbus = devm_regulator_get_optional(dev, "vbus");
+	if (IS_ERR(otg_sx->vbus))
+		otg_sx->vbus = NULL;
 
 	if (ssusb->dr_mode == USB_DR_MODE_HOST)
 		goto out;

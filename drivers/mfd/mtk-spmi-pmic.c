@@ -592,9 +592,21 @@ static int mtk_spmi_pmic_probe(struct spmi_device *sdev)
 		 * cells against a dead interrupt chain leaves children
 		 * (accdet) permanently without their IRQs.
 		 */
-		if (core->irq < 0)
-			return dev_err_probe(&sdev->dev, core->irq,
-					     "PMIC irq parent not ready\n");
+		if (core->irq <= 0) {  /* irq 0 = 无中断域(轮询模式)，同样走降级 */
+			/*
+			 * xaga: pinctrl-EINT 尚未移植，暂时没有中断域。
+			 * 降级为轮询模式：不建中断域，直接展开 DT 子节点 ——
+			 * mtk-spmi-keys 是纯轮询驱动，按键照常工作；
+			 * 需要中断的 cell（regulator/accdet 等）此模式下不启用。
+			 */
+			dev_warn(&sdev->dev,
+				 "PMIC irq unavailable (%d), polling mode\n",
+				 core->irq);
+			core->irq_domain = NULL;
+			return devm_of_platform_populate(&sdev->dev);
+		}
+		return dev_err_probe(&sdev->dev, core->irq,
+				     "PMIC irq parent not ready\n");
 
 		ret = mtk_spmi_pmic_irq_init(core);
 		if (ret)

@@ -119,6 +119,20 @@
 
 #include <kunit/test.h>
 
+/* TB375FC bring-up canary（定义见 arch/arm64/kernel/setup.c） */
+void __init tb_canary(int n);
+void __init tb_canary_solid(void);
+void __init tb_wdt_disable(void);
+
+
+
+
+
+
+
+
+
+
 static int kernel_init(void *);
 
 /*
@@ -1081,6 +1095,7 @@ void start_kernel(void)
 	/* init some links before init_ISA_irqs() */
 	early_irq_init();
 	init_IRQ();
+	tb_canary(9);
 	tick_init();
 	rcu_init_nohz();
 	timers_init();
@@ -1090,6 +1105,7 @@ void start_kernel(void)
 	vdso_setup_data_pages();
 	timekeeping_init();
 	time_init();
+	tb_canary(10);
 
 	/* This must be after timekeeping is initialized */
 	random_init();
@@ -1114,6 +1130,7 @@ void start_kernel(void)
 	 * this. But we do want output early, in case something goes wrong.
 	 */
 	console_init();
+	tb_canary(11);
 	if (panic_later)
 		panic("Too many boot %s vars at `%s'", panic_later,
 		      panic_param);
@@ -1159,6 +1176,7 @@ void start_kernel(void)
 	dbg_late_init();
 	net_ns_init();
 	vfs_caches_init();
+	tb_canary(12);
 	pagecache_init();
 	signals_init();
 	seq_file_init();

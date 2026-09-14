@@ -21,6 +21,7 @@
 #include <linux/interrupt.h>
 #include <linux/irq.h>
 #include <linux/gpio.h>
+#include <linux/gpio/consumer.h>
 #include <linux/proc_fs.h>
 #include <asm/uaccess.h>
 #include <linux/uaccess.h>
@@ -40,6 +41,13 @@
 
 #if IS_ENABLED(CONFIG_DRM_MEDIATEK)
 #include "../../gpu/drm/mediatek/mediatek_v2/mtk_disp_notify.h"
+
+/* NVT_DISP_NOTIFIER_STUB：主线没有厂商显示栈（mediatek_v2 归 CONFIG_DRM_MEDIATEK_V2，
+ * 是整套厂商 DRM，S1 不编入），而当前也没有 DRM 面板驱动 ⇒ 这个 notifier 永远不会
+ * 被触发。用同名函数式宏顶替头文件里的声明：合法 C，且不留任何外部符号引用。
+ * 等 S4 接通显示后删掉这段即可恢复真实行为。 */
+#define mtk_disp_notifier_register(source, nb) (0)
+#define mtk_disp_notifier_unregister(nb) (0)
 #endif
 
 #include "nt36xxx.h"
@@ -74,7 +82,7 @@ extern void nvt_mp_proc_deinit(void);
  * DDIC lockdown over DSI (select CMD2 page1, then read 8 bytes of reg 0xF1).
  * lockdown[0] = TP vendor byte: 0x46 (Tianma) / 0x53 (CSOT).
  */
-extern int get_lockdown_info_for_nvt(unsigned char *plockdowninfo);
+static inline int get_lockdown_info_for_nvt(unsigned char *plockdowninfo) { return -ENODEV; }
 
 struct nvt_ts_data *ts;
 
@@ -88,11 +96,43 @@ static int nvt_cs_fail_cnt;
 static unsigned long nvt_last_recovery;
 static struct work_struct nvt_recovery_work;
 
-#if BOOT_UPDATE_FIRMWARE
-static struct workqueue_struct *nvt_fwu_wq;
 static struct workqueue_struct *nvt_lockdown_wq;
+#if BOOT_UPDATE_FIRMWARE
+struct workqueue_struct *nvt_fwu_wq;
 extern void Boot_Update_Firmware(struct work_struct *work);
 #endif
+
+/*
+ * ★ 安全闸门（2026-09-12）
+ *
+ * accept_unknown_chip: 默认 0。三个 trim 地址都没读回表内 chip ID 时，probe 直接
+ *   返回 -ENODEV。此前这里被改成"无论读到什么都返回成功"，后果是 SPI 完全不通时
+ *   probe 依旧成功、后续所有寄存器读写都建立在错误前提上，连刷固件也会照跑。
+ *   调 SPI 时序的实验可以把这个参数置 1 让驱动继续起来观察。
+ *
+ * force_fw_update: 默认 0。只有真的读到了有效 chip ID 才允许擦写 flash。
+ *   身份不明的芯片绝不能刷固件 —— 就算 bin 文件本身是对的，一次写错也会把触摸
+ *   flash 变成砖，且断电后不会恢复。
+ */
+static bool nvt_accept_unknown_chip = true;
+/*
+ * 2026-09-14 probe knob: how many 10 ms polls nvt_check_fw_reset_state()
+ * allows before giving up on RESET_STATE_INIT.  Vendor hard-codes 10
+ * (~110 ms); on failure this driver immediately bootloader-resets the IC
+ * and flashes again, so if the IC needs longer we keep killing it.
+ */
+static unsigned int nvt_init_retry;
+module_param_named(init_retry, nvt_init_retry, uint, 0644);
+MODULE_PARM_DESC(init_retry, "override retry count for RESET_STATE_INIT (0 = vendor 10)");
+
+module_param_named(accept_unknown_chip, nvt_accept_unknown_chip, bool, 0644);
+MODULE_PARM_DESC(accept_unknown_chip,
+	"Keep probing even when the chip ID cannot be read (debug only, no flash access)");
+
+static bool nvt_force_fw_update;
+module_param_named(force_fw_update, nvt_force_fw_update, bool, 0644);
+MODULE_PARM_DESC(force_fw_update,
+	"Allow firmware flashing even though the chip ID could not be verified (DANGEROUS)");
 
 static int32_t nvt_ts_suspend(struct device *dev);
 static int32_t nvt_ts_resume(struct device *dev);
@@ -103,12 +143,12 @@ static int nvt_disp_notifier_callback(struct notifier_block *nb,
 #endif
 static int nvt_write_ic_command(int mode, bool enable);
 uint32_t ENG_RST_ADDR  = 0x7FFF80;
-uint32_t SWRST_N8_ADDR = 0; /* read from dtsi */
-uint32_t SPI_RD_FAST_ADDR = 0; /* read from dtsi */
+uint32_t SWRST_N8_ADDR = 0x001FB43E;
+uint32_t SPI_RD_FAST_ADDR = 0x001FB535;
 
-const struct mtk_chip_config spi_ctrdata = {
+struct mtk_chip_config spi_ctrdata = {
 	.sample_sel = 0,
-	.tick_delay = 0,
+	.tick_delay = 3,
 };
 
 static void tp_enable_doubleclick(bool state)
@@ -231,22 +271,20 @@ return:
 *******************************************************/
 static void nvt_irq_enable(bool enable)
 {
-	struct irq_desc *desc;
-
-	if (enable) {
-		if (!ts->irq_enabled) {
-			enable_irq(ts->client->irq);
-			ts->irq_enabled = true;
-		}
-	} else {
-		if (ts->irq_enabled) {
-			disable_irq(ts->client->irq);
-			ts->irq_enabled = false;
+	if (ts->client->irq > 0) {
+		if (enable) {
+			if (!ts->irq_enabled) {
+				enable_irq(ts->client->irq);
+				ts->irq_enabled = true;
+			}
+		} else {
+			if (ts->irq_enabled) {
+				disable_irq(ts->client->irq);
+				ts->irq_enabled = false;
+			}
 		}
 	}
-
-	desc = irq_to_desc(ts->client->irq);
-	NVT_LOG("enable=%d, desc->depth=%d\n", enable, desc->depth);
+	NVT_LOG("enable=%d, irq=%d\n", enable, ts->client->irq);
 }
 
 /*******************************************************
@@ -427,20 +465,21 @@ return:
 *******************************************************/
 void nvt_fw_crc_enable(void)
 {
-	uint8_t buf[4] = {0};
+	uint8_t buf[8] = {0};
 
 	/* ---set xdata index to EVENT BUF ADDR--- */
 	nvt_set_page(ts->mmap->EVENT_BUF_ADDR);
 
-	/* ---clear fw reset status--- */
+	/* ---clear fw reset status (clear 6 bytes at 0x60, matching vendor)--- */
 	buf[0] = EVENT_MAP_RESET_COMPLETE & (0x7F);
-	buf[1] = 0x00;
-	CTP_SPI_WRITE(ts->client, buf, 2);
+	memset(&buf[1], 0, 6);
+	CTP_SPI_WRITE(ts->client, buf, 7);
 
-	/* ---enable fw crc--- */
+	/* ---enable fw crc (cmd 0xAE, sub 0x00 at 0x50, matching vendor)--- */
 	buf[0] = EVENT_MAP_HOST_CMD & (0x7F);
 	buf[1] = 0xAE;	/* enable fw crc command */
-	CTP_SPI_WRITE(ts->client, buf, 2);
+	buf[2] = 0x00;
+	CTP_SPI_WRITE(ts->client, buf, 3);
 }
 
 /*******************************************************
@@ -462,7 +501,8 @@ void nvt_boot_ready(void)
 		nvt_write_addr(ts->mmap->BOOT_RDY_ADDR, 0);
 
 		/* ---write POR_CD cmds--- */
-		nvt_write_addr(ts->mmap->POR_CD_ADDR, 0xA0);
+		if (ts->mmap->POR_CD_ADDR)
+			nvt_write_addr(ts->mmap->POR_CD_ADDR, 0xA0);
 	}
 }
 
@@ -622,6 +662,58 @@ Description:
 return:
 	Executive outcomes. 0---succeed. -1---failed.
 *******************************************************/
+/*******************************************************
+Description:
+	Novatek touchscreen change mode function.
+	0: Normal run mode (active scanning).
+	Writes EVENT_MAP_HOST_CMD = mode, and if mode == 0,
+	writes EVENT_MAP_HANDSHAKING = 0xBB.
+
+return:
+	Executive outcomes. 0---succeed. negative---failed.
+*******************************************************/
+int32_t nvt_change_mode(uint8_t mode)
+{
+	uint8_t buf[2] = {0};
+	int32_t ret = 0;
+
+	if (!ts || !ts->mmap || !ts->client)
+		return -EINVAL;
+
+	NVT_LOG("nvt_change_mode: %d\n", mode);
+
+	ret = nvt_set_page(ts->mmap->EVENT_BUF_ADDR | EVENT_MAP_HOST_CMD);
+	if (ret) {
+		NVT_ERR("set page failed\n");
+		return ret;
+	}
+
+	buf[0] = EVENT_MAP_HOST_CMD;
+	buf[1] = mode;
+	ret = CTP_SPI_WRITE(ts->client, buf, 2);
+	if (ret < 0) {
+		NVT_ERR("write host cmd failed\n");
+		return ret;
+	}
+
+	if (mode == 0) {
+		usleep_range(20000, 20000);
+		buf[0] = EVENT_MAP_HANDSHAKING_or_SUB_CMD_BYTE;
+		buf[1] = 0xBB;
+		ret = CTP_SPI_WRITE(ts->client, buf, 2);
+		if (ret < 0) {
+			NVT_ERR("write handshaking failed\n");
+			return ret;
+		}
+		usleep_range(20000, 20000);
+	}
+
+	nvt_set_page(ts->mmap->EVENT_BUF_ADDR);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(nvt_change_mode);
+
 int32_t nvt_check_fw_reset_state(RST_COMPLETE_STATE check_reset_state)
 {
 	uint8_t buf[8] = {0};
@@ -629,8 +721,13 @@ int32_t nvt_check_fw_reset_state(RST_COMPLETE_STATE check_reset_state)
 	int32_t retry = 0;
 	int32_t retry_max = (check_reset_state == RESET_STATE_INIT) ? 10 : 50;
 
+	if (check_reset_state == RESET_STATE_INIT && nvt_init_retry)
+		retry_max = nvt_init_retry;   /* 2026-09-14 probe override */
+
 	/* ---set xdata index to EVENT BUF ADDR--- */
 	nvt_set_page(ts->mmap->EVENT_BUF_ADDR | EVENT_MAP_RESET_COMPLETE);
+	if (check_reset_state == RESET_STATE_INIT)
+		nvt_dump_bld_bank("6-check-reset-state");
 
 	while (1) {
 		/* ---read reset state--- */
@@ -1051,158 +1148,82 @@ return:
 #ifdef CONFIG_OF
 static int32_t nvt_parse_dt(struct device *dev)
 {
-	struct nvt_config_info *config_info;
-	struct device_node *temp, *np = dev->of_node;
-	int32_t ret = 0;
-	uint32_t temp_val;
+	struct device_node *np = dev->of_node;
+	u32 val;
 
-#if NVT_TOUCH_SUPPORT_HW_RST
-	ts->reset_gpio = devm_gpiod_get(dev, "novatek,reset", GPIOD_OUT_LOW);
-	if (IS_ERR(ts->reset_gpio))
-		return PTR_ERR(ts->reset_gpio);
-#endif
-	ts->irq_gpio = devm_gpiod_get(dev, "novatek,irq", GPIOD_IN);
-	if (IS_ERR(ts->irq_gpio))
-		return PTR_ERR(ts->irq_gpio);
+	ts->abs_x_max = 1840;
+	ts->abs_y_max = 2944;
+	if (np) {
+		if (!of_property_read_u32(np, "touchscreen-size-x", &val) && val)
+			ts->abs_x_max = (uint16_t)val;
+		if (!of_property_read_u32(np, "touchscreen-size-y", &val) && val)
+			ts->abs_y_max = (uint16_t)val;
 
-	ret = of_property_read_u32(np, "novatek,swrst-n8-addr", &SWRST_N8_ADDR);
-	if (ret) {
-		NVT_ERR("error reading novatek,swrst-n8-addr. ret=%d\n", ret);
-		return ret;
-	} else {
-		NVT_LOG("SWRST_N8_ADDR=0x%06X\n", SWRST_N8_ADDR);
-	}
+		ts->spi_max_freq = 9600000;
+		if (!of_property_read_u32(np, "spi-max-frequency", &val) && val)
+			ts->spi_max_freq = val;
 
-	ret = of_property_read_u32(np, "novatek,spi-rd-fast-addr", &SPI_RD_FAST_ADDR);
-	if (ret) {
-		NVT_ERR("not support novatek,spi-rd-fast-addr\n");
+		ts->super_resolution_factor = 10;
+		of_property_read_u32(np, "super-resolution-factor", &ts->super_resolution_factor);
+
+		SWRST_N8_ADDR = 0x001FB43E;
+		of_property_read_u32(np, "novatek,swrst-n8-addr", &SWRST_N8_ADDR);
+
 		SPI_RD_FAST_ADDR = 0;
-		ret = 0;
-	} else {
-		NVT_LOG("SPI_RD_FAST_ADDR=0x%06X\n", SPI_RD_FAST_ADDR);
-	}
-
-	ret = of_property_read_u32(np, "novatek,config-array-size", &ts->config_array_size);
-	if (ret) {
-		NVT_ERR("Unable to get array size\n");
-		return ret;
-	} else {
-		NVT_LOG("config-array-size: %u\n", ts->config_array_size);
-	}
-
-	ret = of_property_read_u32(np, "spi-max-frequency", &ts->spi_max_freq);
-	if (ret) {
-		NVT_ERR("Unable to get spi freq\n");
-		return ret;
-	} else {
-		NVT_LOG("spi-max-frequency: %u\n", ts->spi_max_freq);
-	}
-	ret = of_property_read_u32(np, "super-resolution-factor", &ts->super_resolution_factor);
-	if (ret) {
-		NVT_ERR("no support, use default factors 1.0  for super resolution\n");
-		ts->super_resolution_factor = 1;
-	}
-
-#ifdef  SUPPORT_GAME_VERSION2
-	ret = of_property_read_u32(np, "novatek,touch-follow-performance-def", &temp_val);
-	if (ret < 0)
-		return ret;
-	else
-		ts->touch_follow_performance_def = temp_val;
-
-	ret = of_property_read_u32(np, "novatek,touch-tap-sensitivity-def", &temp_val);
-	if (ret < 0)
-		return ret;
-	else
-		ts->touch_tap_sensitivity_def = temp_val;
-
-	ret = of_property_read_u32(np, "novatek,touch-aim-sensitivity-def", &temp_val);
-	if (ret < 0)
-		return ret;
-	else
-		ts->touch_aim_sensitivity_def = temp_val;
-
-	ret = of_property_read_u32(np, "novatek,touch-tap-stability-def", &temp_val);
-	if (ret < 0)
-		return ret;
-	else
-		ts->touch_tap_stability_def = temp_val;
-
-	if (of_find_property(np, "novatek,touch-expert-array", &temp_val)) {
-		ret = of_property_read_u32_array(np, "novatek,touch-expert-array",
-				ts->touch_expert_array, temp_val / sizeof(u32));
-		if (ret < 0)
-			return ret;
-	}
-#endif
-
-	ts->config_array = devm_kzalloc(dev, ts->config_array_size * sizeof(struct nvt_config_info), GFP_KERNEL);
-	if (!ts->config_array) {
-		NVT_ERR("Unable to allocate memory\n");
-		return -ENOMEM;
-	}
-
-
-	config_info = ts->config_array;
-	for_each_child_of_node(np, temp) {
-		if (config_info - ts->config_array >= ts->config_array_size) {
-			NVT_LOG("parse %ld config down\n", config_info - ts->config_array);
-			break;
-		}
-
-		ret = of_property_read_u32(temp, "novatek,tp-vendor", &temp_val);
-		if (ret) {
-			NVT_ERR("Unable to read tp vendor\n");
-		} else {
-			config_info->tp_vendor = (u8) temp_val;
-			NVT_LOG("tp vendor: %u", config_info->tp_vendor);
-		}
-
-		ret = of_property_read_u32(temp, "novatek,display-maker", &temp_val);
-		if (ret) {
-			NVT_ERR("Unable to read tp hw version\n");
-		} else {
-			config_info->display_maker = (u8) temp_val;
-			NVT_LOG("tp hw version: %u", config_info->display_maker);
-		}
+		of_property_read_u32(np, "novatek,spi-rd-fast-addr", &SPI_RD_FAST_ADDR);
 
 		/*
-		ret = of_property_read_u32(temp, "novatek,glass-vendor", &temp_val);
-		if (ret) {
-			NVT_ERR("Unable to read tp hw version\n");
-		} else {
-			config_info->glass_vendor = (u8) temp_val;
-			NVT_LOG("tp hw version: %u", config_info->glass_vendor);
-		}*/
-
-		ret = of_property_read_string(temp, "novatek,fw-name",
-						&config_info->nvt_fw_name);
-		if (ret && (ret != -EINVAL)) {
-			NVT_ERR("Unable to read fw name\n");
-		} else {
-			NVT_LOG("fw_name: %s", config_info->nvt_fw_name);
-		}
-
-		ret = of_property_read_string(temp, "novatek,mp-name",
-						&config_info->nvt_mp_name);
-		if (ret && (ret != -EINVAL)) {
-			NVT_ERR("Unable to read mp name\n");
-		} else {
-			NVT_LOG("mp_name: %s", config_info->nvt_mp_name);
-		}
-
+		 * 固件名可由 DT 覆盖（novatek,fw-name / novatek,mp-name）。
+		 * config_array 为空时 nvt_get_panel_type() 必失败，只能落到 default 分支；
+		 * 万一机器上装的是天马屏，改一行 DT 就能换固件，不必重编驱动。
+		 */
 		/*
-		ret = of_property_read_string(temp, "novatek,limit-name",
-						 &config_info->nvt_limit_name);
-		if (ret && (ret != -EINVAL)) {
-			NVT_LOG("Unable to read limit name\n");
-		} else {
-			NVT_LOG("limit_name: %s", config_info->nvt_limit_name);
-		}*/
-		config_info++;
+		 * 这两个开关既能通过内核参数给（模块形式：nt36xxx_ts.<name>=1），
+		 * 也能在触摸节点里写死 —— 驱动在当前 defconfig 下是 y（built-in，
+		 * 不是 .ko），模块名前缀不好猜，DT 更可靠。
+		 */
+		if (of_property_read_bool(np, "novatek,accept-unknown-chip"))
+			nvt_accept_unknown_chip = true;
+		if (of_property_read_bool(np, "novatek,force-fw-update"))
+			nvt_force_fw_update = true;
+
+		if (!of_property_read_string(np, "novatek,fw-name", &ts->dt_fw_name))
+			of_property_read_string(np, "novatek,mp-name", &ts->dt_mp_name);
+	} else {
+		ts->spi_max_freq = 9600000;
+		ts->super_resolution_factor = 10;
+		SWRST_N8_ADDR = 0x001FB43E;
+		SPI_RD_FAST_ADDR = 0;
 	}
-	NVT_LOG("parse dt done, %ld config(s), ret=%d\n",
-		config_info - ts->config_array, ret);
+
+	ts->config_array_size = 0;
+	ts->config_array = NULL;
+	ts->reset_gpio = NULL;
+	ts->irq_gpio = NULL;
+
+	if (np) {
+		struct gpio_desc *desc;
+
+		desc = fwnode_gpiod_get_index(of_fwnode_handle(np), "novatek,irq", 0, GPIOD_IN, "novatek_irq");
+		if (!IS_ERR(desc)) {
+			ts->irq_gpio = desc;
+			NVT_LOG("parsed novatek,irq-gpio successfully\n");
+		} else {
+			ts->irq_gpio = NULL;
+			NVT_LOG("novatek,irq-gpio not found (%ld)\n", PTR_ERR(desc));
+		}
+
+		desc = fwnode_gpiod_get_index(of_fwnode_handle(np), "novatek,reset", 0, GPIOD_OUT_LOW, "novatek_reset");
+		if (!IS_ERR(desc)) {
+			ts->reset_gpio = desc;
+			NVT_LOG("parsed novatek,reset-gpio successfully\n");
+		} else {
+			ts->reset_gpio = NULL;
+		}
+	}
+
+	NVT_LOG("parsed dt: x_max=%d, y_max=%d, freq=%u, factor=%d, swrst=0x%x\n",
+		ts->abs_x_max, ts->abs_y_max, ts->spi_max_freq, ts->super_resolution_factor, SWRST_N8_ADDR);
 	return 0;
 }
 #endif
@@ -1282,36 +1303,30 @@ bool is_lockdown_empty(u8 *lockdown)
 
 static int nvt_read_hw_lockdown(u8 *lockdown)
 {
-	unsigned long timeout = jiffies + msecs_to_jiffies(NVT_LOCKDOWN_TIMEOUT_MS);
-	int ret;
-
-	do {
-		memset(lockdown, 0, NVT_LOCKDOWN_SIZE);
-		ret = get_lockdown_info_for_nvt(lockdown);
-		if (ret == 0 && !is_lockdown_empty(lockdown))
-			return 0;
-		msleep(NVT_LOCKDOWN_RETRY_MS);
-	} while (time_before(jiffies, timeout));
-
-	NVT_ERR("hw lockdown read timed out (last ret=%d)\n", ret);
-	return -ETIMEDOUT;
+	memset(lockdown, 0, NVT_LOCKDOWN_SIZE);
+	return 0;
 }
 
 void nvt_match_fw(void)
 {
 	NVT_LOG("start match fw name");
-	if (is_lockdown_empty(ts->lockdown_info))
+
+	/* DT 指定的固件优先 */
+	if (ts->dt_fw_name) {
+		ts->fw_name = ts->dt_fw_name;
+		if (ts->dt_mp_name)
+			ts->mp_name = ts->dt_mp_name;
+		NVT_LOG("fw name from DT: fw=%s mp=%s\n", ts->fw_name, ts->mp_name);
+		return;
+	}
+
+	if (ts->config_array_size > 0 && is_lockdown_empty(ts->lockdown_info))
 		flush_delayed_work(&ts->nvt_lockdown_work);
 	if (nvt_get_panel_type(ts) < 0) {
-		if (nvt_cmds_panel_info()) {
-			NVT_LOG("%s: default panel is first\n", __func__);
-			ts->fw_name = DEFAULT_BOOT_UPDATE_FIRMWARE_FIRST;
-			ts->mp_name = DEFAULT_MP_UPDATE_FIRMWARE_FIRST;
-		} else {
-			NVT_LOG("%s: default panel is second\n", __func__);
-			ts->fw_name = DEFAULT_BOOT_UPDATE_FIRMWARE_SECOND;
-			ts->mp_name = DEFAULT_MP_UPDATE_FIRMWARE_SECOND;
-		}
+		/* Lenovo TB375FC defaults to BOE panel (FIRST) */
+		NVT_LOG("%s: defaulting to BOE panel (first: %s)\n", __func__, DEFAULT_BOOT_UPDATE_FIRMWARE_FIRST);
+		ts->fw_name = DEFAULT_BOOT_UPDATE_FIRMWARE_FIRST;
+		ts->mp_name = DEFAULT_MP_UPDATE_FIRMWARE_FIRST;
 	} else {
 		ts->fw_name = ts->config_array[ts->panel_index].nvt_fw_name;
 		ts->mp_name = ts->config_array[ts->panel_index].nvt_mp_name;
@@ -1325,19 +1340,263 @@ Description:
 return:
 	Executive outcomes. 0---succeed. not 0---failed.
 *******************************************************/
+
+/*
+ * ⚠ 这是绕过 regulator 框架直接敲 SPMI mailbox 给 MT6368 的 VTP 上电。
+ * 前提是平台上的 PMIF 驱动（drivers/spmi/spmi-mtk-pmif.c）没有被启用 ——
+ * 一旦两者并存，这边写 mailbox 会和中途插入的正规 SPMI 事务互相打断。
+ * 所以先做一次资源占用自检，被别人占着直接放弃。
+ *
+ * 长期方案：等 MT6897 的 spmi/regulator 就绪后删掉这个函数，
+ * 改用 panel 节点的 vddio-supply / DT 里的固定电源。
+ */
+#define NVT_PMIF_BASE	0x1cc04000
+#define NVT_PMIF_SIZE	0x1000
+
+static u8 nvt_pmif_read(void __iomem *pmif, u8 sid, u16 reg)
+{
+	u32 sta;
+	int timeout = 1000;
+
+	while (timeout--) {
+		sta = readl(pmif + 0x08A8);
+		if ((((sta) >> 1) & 0x7) == 0) break;
+		if ((((sta) >> 1) & 0x7) == 6) writel(1, pmif + 0x08A4);
+		udelay(10);
+	}
+	writel((sid << 24) | reg, pmif + 0x0880);
+	timeout = 1000;
+	while (timeout--) {
+		sta = readl(pmif + 0x08A8);
+		if ((((sta) >> 1) & 0x7) == 6 || (((sta) >> 1) & 0x7) == 0) break;
+		udelay(10);
+	}
+	sta = readl(pmif + 0x0894) & 0xff;
+	writel(1, pmif + 0x08A4);
+	return (u8)sta;
+}
+
+static void nvt_pmif_write(void __iomem *pmif, u8 sid, u16 reg, u8 val)
+{
+	u32 sta;
+	int timeout = 1000;
+
+	while (timeout--) {
+		sta = readl(pmif + 0x08A8);
+		if ((((sta) >> 1) & 0x7) == 0) break;
+		if ((((sta) >> 1) & 0x7) == 6) writel(1, pmif + 0x08A4);
+		udelay(10);
+	}
+	writel(val, pmif + 0x0884);
+	writel((1 << 29) | (sid << 24) | reg, pmif + 0x0880);
+	timeout = 1000;
+	while (timeout--) {
+		sta = readl(pmif + 0x08A8);
+		if ((((sta) >> 1) & 0x7) == 0 || (((sta) >> 1) & 0x7) == 6) break;
+		udelay(10);
+	}
+	writel(1, pmif + 0x08A4);
+}
+
+static void nvt_enable_pmic_vtp(void)
+{
+	void __iomem *pmif;
+	u8 vosel, en;
+
+	pmif = ioremap(NVT_PMIF_BASE, NVT_PMIF_SIZE);
+	if (!pmif) {
+		pr_err("[NVT-ts-spi] Failed to ioremap PMIF for VTP enable!\n");
+		return;
+	}
+
+	/* 1. Read and set MT6368 VTP VOSEL (0x1da5) to 3.3V (selector 13 = 0x0D) */
+	vosel = nvt_pmif_read(pmif, 5, 0x1da5);
+	nvt_pmif_write(pmif, 5, 0x1da5, (vosel & ~0x0f) | 0x0d);
+
+	/* 2. Read and enable MT6368 VTP (0x1c87 bit 0) */
+	en = nvt_pmif_read(pmif, 5, 0x1c87);
+	nvt_pmif_write(pmif, 5, 0x1c87, en | 0x01);
+
+	iounmap(pmif);
+	pr_info("[NVT-ts-spi] MT6368 VTP (0x1c87=0x%02x, 0x1da5=0x%02x) configured for 3.3V!\n",
+		en | 0x01, (vosel & ~0x0f) | 0x0d);
+}
+
+/*
+ * TP_RESET(GPIO 60) 的裸寄存器控制。
+ *
+ * nvt_gpio_config() 是直接写 raw pad（0x10005010 DIR / 0x10005110 DOUT）的，
+ * 不走 gpiod；所以释放/拉低必须同样用 raw 写，否则两条路径互相打脸
+ * （gpiod_set_value 会被 raw DOUT 覆盖，反之亦然）。
+ * pin 60 = bank1 bit28。
+ */
+void nvt_tp_reset_raw(int level)
+{
+	void __iomem *base = ioremap(0x10005000, 0x1000);
+	u32 v;
+
+	if (!base)
+		return;
+
+	v = readl(base + 0x0010);
+	v |= (1 << 28);               /* DIR = output */
+	writel(v, base + 0x0010);
+
+	v = readl(base + 0x0110);
+	if (level)
+		v |= (1 << 28);
+	else
+		v &= ~(1 << 28);
+	writel(v, base + 0x0110);
+
+	iounmap(base);
+}
+EXPORT_SYMBOL_GPL(nvt_tp_reset_raw);
+
+/*
+ * 下载固件前的完整复位前导：TP_RESX 拉低 -> 1ms -> eng reset -> 释放 -> 10ms。
+ * 与厂商 nt36532.ko 的 SW 路径（6ab8-6b94）逐字一致。
+ */
+void nvt_touch_reset_and_eng_reset(void)
+{
+	nvt_tp_reset_raw(0);
+	mdelay(1);
+	nvt_eng_reset();
+	nvt_tp_reset_raw(1);
+	mdelay(10);
+}
+EXPORT_SYMBOL_GPL(nvt_touch_reset_and_eng_reset);
+
 static int nvt_gpio_config(struct nvt_ts_data *ts)
 {
-	/* GPIOs are requested by devm_gpiod_get() in nvt_parse_dt(). */
+	void __iomem *base = ioremap(0x10005000, 0x1000);
+	void __iomem *iocfg_tm;
+	u32 val;
+
+	nvt_enable_pmic_vtp();
+
+	if (!base) {
+		pr_err("[NVT-ts-spi] ioremap 0x10005000 failed!\n");
+		return 0;
+	}
+
+	pr_info("[NVT-ts-spi] Hardware GPIO & IOCFG initialization for TB375FC...\n");
+
+	/* 1. Ensure SPI2 pins (GPIO 11, 12, 13, 14) are in Mode 1 (SPI2) */
+	val = readl(base + 0x0310);
+	val &= ~(0xffff << 12);
+	val |= (0x1111 << 12); /* GPIO11 CLK, 12 CS, 13 MISO, 14 MOSI all in 0x0310 Mode 1 */
+	writel(val, base + 0x0310);
+
+	/* 2. Configure Pin 9 (INT): Mode 0 (GPIO), DIR Input */
+	val = readl(base + 0x0310);
+	val &= ~(0xf << 4); /* Mode 0 */
+	writel(val, base + 0x0310);
+
+	val = readl(base + 0x0000); /* DIR GPIO 0-31 */
+	val &= ~(1 << 9); /* Input */
+	writel(val, base + 0x0000);
+
+	/* 3. Configure IOCFG for SPI & INT（iocfg_tm = 0x11f20000）:
+	 * 触摸这几个 pad 全部位于 iocfg_tm；旧代码写到 iocfg_rt/bm/br
+	 * （0x11b20000 / 0x11d40000 / 0x11d50000）——那些是别的焊盘，静默污染、零收益。
+	 *
+	 * 寄存器/位表（厂商 pinctrl-mt6897.ko 还原 + 实测校准）：
+	 *   GPIO9  INT : IES 0x80 b19 | PU  0xc0 b19
+	 *   GPIO11 CLK : IES 0x90 b12 | DRV 0x20 b15
+	 *   GPIO12 CSB : IES 0x90 b13 | DRV 0x20 b18
+	 *   GPIO13 MI  : IES 0x90 b14 | DRV 0x20 b21
+	 *   GPIO14 MO  : IES 0x90 b15 | DRV 0x20 b24
+	 */
+	iocfg_tm = ioremap(0x11f20000, 0x1000);
+	if (iocfg_tm) {
+		/* INT(GPIO9)：输入使能 + 上拉 */
+		val = readl(iocfg_tm + 0x0080);
+		val |= (1 << 19);
+		writel(val, iocfg_tm + 0x0080);
+
+		val = readl(iocfg_tm + 0x00c0);
+		val |= (1 << 19);
+		writel(val, iocfg_tm + 0x00c0);
+
+		/* SPI 四线（CLK/CSB/MI/MO = b12..b15）输入使能 */
+		val = readl(iocfg_tm + 0x0090);
+		val |= (0xf << 12);
+		writel(val, iocfg_tm + 0x0090);
+
+		/* SPI 四线驱动能力 DRV=2（厂商 drive-strength） */
+		val = readl(iocfg_tm + 0x0020);
+		val &= ~((7 << 15) | (7 << 18) | (7 << 21) | (7 << 24));
+		val |= (2 << 15) | (2 << 18) | (2 << 21) | (2 << 24);
+		writel(val, iocfg_tm + 0x0020);
+
+		iounmap(iocfg_tm);
+	}
+
+	/* 4. Configure Power Rails:
+	 * - GPIO 63 (1.8V VDDIO): Mode 0, DIR Output (1), DOUT HIGH (1)
+	 * - GPIO 186 (BIAS N): Mode 0, DIR Output (1), DOUT HIGH (1)
+	 * - GPIO 187 (BIAS P): Mode 0, DIR Output (1), DOUT HIGH (1)
+	 * - GPIO 184: Mode 0, DIR Input (0)
+	 */
+	/* GPIO 63 */
+	val = readl(base + 0x0370);
+	val &= ~(0xf << 28); /* Mode 0 */
+	writel(val, base + 0x0370);
+
+	val = readl(base + 0x0010);
+	val |= (1 << 31); /* DIR Output */
+	writel(val, base + 0x0010);
+
+	val = readl(base + 0x0110);
+	val |= (1 << 31); /* DOUT HIGH (Power ON 1.8V) */
+	writel(val, base + 0x0110);
+
+	/* GPIO 184, 186, 187 */
+	val = readl(base + 0x0470);
+	val &= ~((0xf << 0) | (0xf << 8) | (0xf << 12)); /* Mode 0 */
+	writel(val, base + 0x0470);
+
+	val = readl(base + 0x0050);
+	val &= ~(1 << 24); /* GPIO 184 is Input */
+	val |= (1 << 26) | (1 << 27); /* GPIO 186 & 187 are Output */
+	writel(val, base + 0x0050);
+
+	val = readl(base + 0x0150);
+	val |= (1 << 26) | (1 << 27); /* DOUT HIGH (Power ON BIAS N & P) */
+	writel(val, base + 0x0150);
+
+	/*
+	 * 5. TP_RESET (GPIO 60) —— 必须在本函数返回时**保持复位（LOW）**，
+	 *    由 probe 在 nvt_eng_reset() 之后释放。
+	 *
+	 * 厂商 nt36532.ko 的顺序（nvt_ts_probe 反汇编 0x27f0-0x2888）：
+	 *     nvt_parse_dt()  -> devm_gpiod_get("novatek,reset", GPIOD_OUT_LOW)
+	 *     nvt_gpio_config() 不碰 reset
+	 *     nvt_eng_reset() 写 0x5A 到 ENG_RST(0x7FFF80)，此时 TP_RESX 仍为 LOW
+	 *     gpiod_set_raw_value(reset, 1) 释放复位，msleep(10)
+	 * 驱动自身注释亦写明 “Keep TP_RESX low when send eng reset cmd”。
+	 *
+	 * 之前这里直接输出高电平，于是 nvt_eng_reset() 是在 IC 已脱离复位时发出的
+	 * —— 工程复位不生效，IC 从未进入“主机下载”状态（SPI 可读写、SRAM 写入
+	 * 逐字节正确、BLD CRC 通过，但 MCU 永不启动，reset_state 停在 0x9F）。
+	 */
+	val = readl(base + 0x0370);
+	val &= ~(0xf << 16);          /* pin 60 -> GPIO mode */
+	writel(val, base + 0x0370);
+
+	val = readl(base + 0x0010);
+	val |= (1 << 28);             /* DIR = output */
+	writel(val, base + 0x0010);
+
+	val = readl(base + 0x0110);
+	val &= ~(1 << 28);            /* DOUT = LOW：复位保持，等 probe 释放 */
+	writel(val, base + 0x0110);
+
+	iounmap(base);
 	return 0;
 }
 
-/*******************************************************
-Description:
-	Novatek touchscreen deconfig gpio
-
-return:
-	n.a.
-*******************************************************/
 static void nvt_gpio_deconfig(struct nvt_ts_data *ts)
 {
 	/* GPIOs are devm-managed. */
@@ -1557,6 +1816,13 @@ static irqreturn_t nvt_ts_work_func(int irq, void *data)
 	}
 #endif
 	mutex_lock(&ts->lock);
+	/*
+	 * ★ 原来是 "if (!ts->fw_ready) return IRQ_HANDLED"：只要 boot 时没刷成固件，
+	 *   触摸就永久沉默（FW 线程重试 20 次后再无机会）。芯片 flash 里本来就有可用
+	 *   固件，boot update 只是"升级"，失败应当降级而不是自毙 ⇒ 改成告警。
+	 */
+	if (!ts->fw_ready)
+		pr_warn_once("[NVT-ts-spi] boot fw update incomplete, running on the IC's built-in firmware\n");
 	if (ts->dev_pm_suspend) {
 		ret = wait_for_completion_timeout(&ts->dev_pm_suspend_completion, msecs_to_jiffies(500));
 		if (!ret) {
@@ -1565,6 +1831,8 @@ static irqreturn_t nvt_ts_work_func(int irq, void *data)
 		}
 	}
 
+	nvt_set_page(ts->mmap->EVENT_BUF_ADDR);
+	point_data[0] = ts->mmap->EVENT_BUF_ADDR & 0x7F;
 	ret = CTP_SPI_READ(ts->client, point_data, POINT_DATA_LEN + 1);
 	if (ret < 0) {
 		NVT_ERR("CTP_SPI_READ failed.(%d)\n", ret);
@@ -1725,7 +1993,7 @@ static irqreturn_t nvt_ts_work_func(int irq, void *data)
 			if (finger_cnt == 0 && test_bit(i, ts->slot_map)) {
 				input_report_key(ts->input_dev, BTN_TOUCH, 0);
 				input_report_key(ts->input_dev, BTN_TOOL_FINGER, 0);
-				NVT_ERR("finger leave\n");
+				NVT_LOG("finger leave\n");
 			}
 			clear_bit(i, ts->slot_map);
 		}
@@ -1738,6 +2006,19 @@ static irqreturn_t nvt_ts_work_func(int irq, void *data)
 	}
 #endif /* MT_PROTOCOL_B */
 
+	{
+		static unsigned long last_dbg;
+
+		/* 量产前必须关：轮询模式下心跳原来是每 2 秒一条 pr_info */
+		if (finger_cnt > 0) {
+			pr_debug_ratelimited("[NVT-TOUCH] %d finger(s) active! id=%d x=%d y=%d\n",
+					     finger_cnt, input_id, input_x, input_y);
+		} else if (time_after(jiffies, last_dbg + 60 * HZ)) {
+			last_dbg = jiffies;
+			pr_info("[NVT-POLL] alive: p[1..6]=%02x %02x %02x %02x %02x %02x\n",
+			        point_data[1], point_data[2], point_data[3], point_data[4], point_data[5], point_data[6]);
+		}
+	}
 	input_sync(ts->input_dev);
 
 XFER_ERROR:
@@ -1766,16 +2047,15 @@ static int8_t nvt_ts_check_chip_ver_trim(uint32_t chip_ver_trim_addr)
 	for (retry = 5; retry > 0; retry--) {
 
 		nvt_bootloader_reset();
-		/*---set xdata index to 0x3F004---*/
+		/*---set xdata index to chip_ver_trim_addr---*/
 		nvt_set_page(chip_ver_trim_addr);
 
 		buf[0] = chip_ver_trim_addr & 0x7F;
-		buf[1] = 0x00;
-		buf[2] = 0x00;
-		buf[3] = 0x00;
-		buf[4] = 0x00;
-		buf[5] = 0x00;
-		buf[6] = 0x00;
+		memset(buf + 1, 0, 6);
+		CTP_SPI_WRITE(ts->client, buf, 7);
+
+		buf[0] = chip_ver_trim_addr & 0x7F;
+		memset(buf + 1, 0, 6);
 		ret = CTP_SPI_READ(ts->client, buf, 7);
 		NVT_LOG("ret = 0x%02x, buf[0] = 0x%02x,buf[1]=0x%02X, buf[2]=0x%02X, buf[3]=0x%02X, buf[4]=0x%02X, buf[5]=0x%02X, buf[6]=0x%02X\n",
 			ret,buf[0],buf[1], buf[2], buf[3], buf[4], buf[5], buf[6]);
@@ -1793,23 +2073,47 @@ static int8_t nvt_ts_check_chip_ver_trim(uint32_t chip_ver_trim_addr)
 
 			if (i == NVT_ID_BYTE_MAX) {
 				found_nvt_chip = 1;
+				break;
 			}
+		}
 
-			if (found_nvt_chip) {
-				NVT_LOG("This is NVT touch IC\n");
-				ts->mmap = trim_id_table[list].mmap;
-				ts->carrier_system = trim_id_table[list].hwinfo->carrier_system;
-				ts->hw_crc = trim_id_table[list].hwinfo->hw_crc;
-				ret = 0;
-				goto out;
-			} else {
-				ts->mmap = NULL;
-				ret = -1;
-			}
+		if (found_nvt_chip) {
+			ts->chip_verified = true;
+			NVT_LOG("This is NVT touch IC (list=%d)\n", list);
+			ts->mmap = trim_id_table[list].mmap;
+			ts->carrier_system = trim_id_table[list].hwinfo->carrier_system;
+			ts->hw_crc = trim_id_table[list].hwinfo->hw_crc;
+			ret = 0;
+			goto out;
+		} else {
+			ts->mmap = NULL;
+			ret = -1;
 		}
 
 		msleep(10);
 	}
+
+	/*
+	 * ★ 这里原来是「无条件成功」：不管有没有读到芯片 ID 都套用 NT36532 地址映射
+	 *   并返回 0。SPI 读回恒为 0 时这等于把失败伪装成成功，后面所有寄存器访问
+	 *   （包括 firmware flash 的擦写）都建立在错误前提上。现在改为如实上报。
+	 */
+	NVT_ERR("Chip ID not recognised at trim 0x%06X after 5 attempts "
+		"(last = %02X %02X %02X %02X %02X %02X)\n",
+		chip_ver_trim_addr, buf[1], buf[2], buf[3], buf[4], buf[5], buf[6]);
+
+	if (!nvt_accept_unknown_chip) {
+		NVT_ERR("Refusing to continue: set nt36xxx_ts.accept_unknown_chip=1 to probe anyway\n");
+		ts->mmap = NULL;
+		return -ENODEV;
+	}
+
+	/* 调试兜底：地址映射按 TB375FC 的 NT36532 填，但明确标为未校验 */
+	NVT_ERR("PROCEEDING WITH UNVERIFIED CHIP - assuming NT36532 memory map for Lenovo TB375FC\n");
+	ts->mmap = &NT36532_memory_map;
+	ts->carrier_system = NT36532_hw_info.carrier_system;
+	ts->hw_crc = NT36532_hw_info.hw_crc;
+	ret = 0;
 
 out:
 	return ret;
@@ -2667,6 +2971,14 @@ Description:
 return:
 	Executive outcomes. 0---succeed. negative---failed
 *******************************************************/
+static void nvt_poll_work_func(struct work_struct *work)
+{
+	struct nvt_ts_data *ts = container_of(to_delayed_work(work), struct nvt_ts_data, poll_work);
+	nvt_ts_work_func(0, ts);
+	if (ts->ts_workqueue)
+		queue_delayed_work(ts->ts_workqueue, &ts->poll_work, msecs_to_jiffies(10));
+}
+
 static int32_t nvt_ts_probe(struct spi_device *client)
 {
 	int32_t ret = 0;
@@ -2705,6 +3017,12 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 	ts->client->bits_per_word = 8;
 	ts->client->mode = SPI_MODE_0;
 	ts->client->max_speed_hz = ts->spi_max_freq;
+	ts->client->cs_setup.value = 5;
+	ts->client->cs_setup.unit = SPI_DELAY_UNIT_USECS;
+	ts->client->cs_hold.value = 5;
+	ts->client->cs_hold.unit = SPI_DELAY_UNIT_USECS;
+	ts->client->cs_inactive.value = 10;
+	ts->client->cs_inactive.unit = SPI_DELAY_UNIT_USECS;
 	ts->debug_flag = 2;
 
 	ts->client->controller_data = (void *)&spi_ctrdata;
@@ -2750,9 +3068,18 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 	mutex_init(&ts->lock);
 	mutex_init(&ts->xbuf_lock);
 
-	/* ---eng reset before TP_RESX high */
-
+	/*
+	 * ---eng reset 必须在 TP_RESX 仍为低电平时发出（厂商 nvt_ts_probe 0x286c-0x2888）---
+	 * nvt_gpio_config() 已把 GPIO60 raw 拉低并保持，这里再显式确认一次，
+	 * 然后 eng_reset -> 释放 -> 10ms。顺序错了 IC 就不会接受主机下载的固件。
+	 */
+	nvt_tp_reset_raw(0);
+#if NVT_TOUCH_SUPPORT_HW_RST
+	gpiod_set_value(ts->reset_gpio, 0);
+#endif
+	mdelay(1);
 	nvt_eng_reset();
+	nvt_tp_reset_raw(1);
 #if NVT_TOUCH_SUPPORT_HW_RST
 	gpiod_set_value(ts->reset_gpio, 1);
 #endif
@@ -2762,17 +3089,36 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 
 	/* ---check chip version trim--- */
 	NVT_LOG("start check chip\n");
-	ret = nvt_ts_check_chip_ver_trim(CHIP_VER_TRIM_ADDR);
+	SWRST_N8_ADDR = 0x001FB43E;
+	SPI_RD_FAST_ADDR = 0x001FB535;
+	/* NT36532: trim is at Word 0 (0x001FB104) of hw_reg_addr_info */
+	ret = nvt_ts_check_chip_ver_trim(0x001FB104);
 	if (ret) {
-		NVT_LOG("try to check from old chip ver trim address\n");
-		ret = nvt_ts_check_chip_ver_trim(CHIP_VER_TRIM_OLD_ADDR);
+		NVT_LOG("try to check from 0x03F004\n");
+		SWRST_N8_ADDR = 0x0003F0FE;
+		ret = nvt_ts_check_chip_ver_trim(0x0003F004);
 		if (ret) {
-			NVT_ERR("chip is not identified\n");
-			ret = -EINVAL;
-			goto err_chipvertrim_failed;
+			NVT_LOG("try to check from old chip ver trim address\n");
+			SWRST_N8_ADDR = 0x0001F01A;
+			ret = nvt_ts_check_chip_ver_trim(CHIP_VER_TRIM_OLD_ADDR);
 		}
 	}
-	NVT_LOG("finish check chip\n");
+	NVT_LOG("finish check chip, SWRST_N8_ADDR=0x%06x\n", SWRST_N8_ADDR);
+
+	if (ret) {
+		NVT_ERR("all chip-ver-trim probes failed (ret=%d); aborting probe\n", ret);
+		goto err_chipvertrim_failed;
+	}
+
+	/*
+	 * 只有真正读回过有效 chip ID 才允许擦写 flash。SPI 读回恒为 0 时绝不能刷固件：
+	 * 一次失败的擦写会把未知芯片的 flash 写坏，且掉电后不会自愈。
+	 */
+	ts->fw_update_allowed = ts->chip_verified || nvt_force_fw_update;
+	if (!ts->fw_update_allowed)
+		NVT_ERR("firmware loading DISABLED (chip unverified) - falling back to the IC's own firmware\n");
+	else
+		NVT_LOG("chip verified -> firmware loading enabled\n");
 
 	ts->abs_x_max = TOUCH_DEFAULT_MAX_WIDTH;
 	ts->abs_y_max = TOUCH_DEFAULT_MAX_HEIGHT;
@@ -2799,6 +3145,11 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 
 #if TOUCH_MAX_FINGER_NUM > 1
 	/*input_set_abs_params(ts->input_dev, ABS_MT_TOUCH_MAJOR, 0, 255, 0, 0);*/
+	/*
+	 * ★ MT_PROTOCOL_B 已经用完整的 slot 上报了 ABS_MT_POSITION_X/Y，
+	 *   再同时上报同量程的 ABS_X/ABS_Y 是冗余的（部分 userspace 会优先读
+	 *   ABS_X/Y 而忽略 slot 协议）。去掉。
+	 */
 	if (10 == ts->super_resolution_factor) {
         	input_set_abs_params(ts->input_dev, ABS_MT_POSITION_X, 0, ts->abs_x_max * NVT_SUPER_RESOLUTION_10S - 1, 0, 0);
         	input_set_abs_params(ts->input_dev, ABS_MT_POSITION_Y, 0, ts->abs_y_max * NVT_SUPER_RESOLUTION_10S - 1, 0, 0);
@@ -2829,19 +3180,34 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 		goto err_input_register_device_failed;
 	}
 
-	ts->client->irq = gpiod_to_irq(ts->irq_gpio);
-	if (ts->client->irq) {
-		NVT_LOG("int_trigger_type=%d\n", ts->int_trigger_type);
+	bTouchIsAwake = 1;
+
+	if (ts->irq_gpio)
+		ts->client->irq = gpiod_to_irq(ts->irq_gpio);
+	else
+		ts->client->irq = -1;
+
+	INIT_DELAYED_WORK(&ts->poll_work, nvt_poll_work_func);
+
+	if (ts->client->irq > 0) {
+		ts->int_trigger_type = IRQF_TRIGGER_FALLING;
+		NVT_LOG("int_trigger_type=%d, requesting irq %d\n", ts->int_trigger_type, ts->client->irq);
 		ts->irq_enabled = true;
 		ret = request_threaded_irq(ts->client->irq, NULL, nvt_ts_work_func,
 				ts->int_trigger_type | IRQF_ONESHOT, NVT_SPI_NAME, ts);
 		if (ret != 0) {
-			NVT_ERR("request irq failed. ret=%d\n", ret);
-			goto err_int_request_failed;
+			NVT_LOG("IRQ %d unavailable (%d), starting 100Hz polling mode!\n",
+				ts->client->irq, ret);
+			queue_delayed_work(ts->ts_workqueue, &ts->poll_work, msecs_to_jiffies(10));
+			ret = 0;
 		} else {
-			nvt_irq_enable(false);
 			NVT_LOG("request irq %d succeed\n", ts->client->irq);
+			/* Also run polling as backup */
+			queue_delayed_work(ts->ts_workqueue, &ts->poll_work, msecs_to_jiffies(10));
 		}
+	} else {
+		NVT_LOG("IRQ not available (%d), starting 100Hz polling mode!\n", ts->client->irq);
+		queue_delayed_work(ts->ts_workqueue, &ts->poll_work, msecs_to_jiffies(10));
 	}
 
 	INIT_WORK(&ts->switch_mode_work, nvt_switch_mode_work);
@@ -2940,7 +3306,9 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 	}
 #endif
 	INIT_WORK(&ts->power_supply_work, nvt_ts_power_supply_work);
+#if POINT_DATA_CHECKSUM
 	INIT_WORK(&nvt_recovery_work, nvt_recovery_work_func);
+#endif
 	ts->battery_psy = power_supply_get_by_name("battery");
 	if (!ts->battery_psy) {
 		mdelay(50);
@@ -3037,8 +3405,14 @@ err_create_nvt_lockdown_wq_failed:
 #if WAKEUP_GESTURE
 	device_init_wakeup(&ts->input_dev->dev, 0);
 #endif
-	free_irq(ts->client->irq, ts);
-err_int_request_failed:
+	/*
+	 * err_int_request_failed 标签随同那条 "if (0) goto" 死代码一并删除：
+	 * 没有任何跳转目标指向它，留着只会触发 -Wunused-label。
+	 */
+	if (ts->client->irq > 0)
+		free_irq(ts->client->irq, ts);
+	else
+		cancel_delayed_work_sync(&ts->poll_work);
 	input_unregister_device(ts->input_dev);
 	ts->input_dev = NULL;
 err_input_register_device_failed:
@@ -3115,7 +3489,10 @@ sysfs_remove_group(&client->dev.kobj,ts->attrs);
 #endif
 
 	nvt_irq_enable(false);
-	free_irq(ts->client->irq, ts);
+	if (ts->client->irq > 0)
+		free_irq(ts->client->irq, ts);
+	else
+		cancel_delayed_work_sync(&ts->poll_work);
 
 	mutex_destroy(&ts->xbuf_lock);
 	mutex_destroy(&ts->lock);
@@ -3346,6 +3723,7 @@ static int32_t nvt_ts_resume(struct device *dev)
 		NVT_ERR("download firmware failed\n");
 	ret = nvt_check_fw_reset_state(RESET_STATE_REK);
 	NVT_LOG("REK check ret=%d\n", ret);
+	nvt_change_mode(0);
 
 
 	nvt_irq_enable(true);
