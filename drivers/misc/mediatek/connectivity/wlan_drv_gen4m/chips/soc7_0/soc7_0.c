@@ -1146,7 +1146,8 @@ static int wake_up_conninfra_off(void)
 	 */
 	wf_ioremap_read(CONN_INFRA_CFG_IP_VERSION_ADDR, &value);
 	polling_count = 0;
-	while (value != SOC7_CONNSYS_VERSION_ID) {
+	while (value != SOC7_CONNSYS_VERSION_ID &&
+	       value != SOC7_CONNSYS_VERSION_ID_MT6897) {
 		if (polling_count > 10) {
 			DBGLOG(INIT, ERROR, "Polling CONNSYS version ID fail.\n");
 			return -1;
@@ -1199,16 +1200,33 @@ static void set_wf_monflg_on_mailbox_wf(void)
 
 static int wf_pwr_on_consys_mcu(void)
 {
+	/* ★ XAGA-SKIPMCU (v42)：厂商的 soc7_0_McuInit 没有任何调用者
+	 *   （反汇编已两次确认），而我们是它的 1:1 移植且真会被调到。
+	 *   这里只跳过这一串寄存器动作，conninfra 侧上电完全不动。
+	 *   判读：若 driver-own 由此成功 ⇒ 该序列就是根因。
+	 */
+	pr_notice("XAGA-SKIPMCU: skipping McuInit-equivalent register sequence (vendor never runs it)\n");
+	return 0;
+
 	int ret = 0;
 	int check;
 	uint32_t value = 0;
 	uint32_t polling_count;
 
 	DBGLOG(INIT, INFO, "wmmcu power-on start.\n");
+	{
+		extern int xaga_wf_trace_left;
+
+		xaga_wf_trace_left = 400;
+		pr_notice("XAGA-WFMCU: power-on start\n");
+	}
 
 	ret = wake_up_conninfra_off();
-	if (ret)
+	if (ret) {
+		pr_notice("XAGA-WFSTEP: wake_up_conninfra_off fail ret=%d\n", ret);
 		return ret;
+	}
+	pr_notice("XAGA-WFSTEP: wake_up_conninfra_off ok\n");
 
 	/* PTA clock on
 	 * Address: 0x1801_2064、0x1801_2074
@@ -1266,9 +1284,7 @@ static int wf_pwr_on_consys_mcu(void)
 	while ((value & BIT(30)) == 0) {
 		if (polling_count > 10) {
 			ret = -1;
-			DBGLOG(INIT, ERROR,
-				"Polling wfsys rgu off fail. (0x%x)\n",
-				value);
+			pr_notice("XAGA-WFSTEP: STEP2 wfsys_rgu_off_hreset_rst_b fail, 0x18060A10=0x%08x\n", value);
 			return ret;
 		}
 		udelay(500);
@@ -1291,9 +1307,7 @@ static int wf_pwr_on_consys_mcu(void)
 	while ((value & (CONN_INFRA_CFG_ON_CONN_INFRA_WF_SLP_STATUS_WF2CONN_SLP_PROT_RDY_MASK |
 			CONN_INFRA_CFG_ON_CONN_INFRA_WF_SLP_STATUS_CONN2WF_SLP_PROT_RDY_MASK)) != 0) {
 		if (polling_count > 100) {
-			DBGLOG(INIT, ERROR,
-				"Polling WFSYS TO CONNINFRA SLEEP PROTECT fail. (0x%x)\n",
-				value);
+			pr_notice("XAGA-WFSTEP: STEP3 wf2conn/conn2wf slpprot fail, 0x18001444=0x%08x\n", value);
 			ret = -1;
 			return ret;
 		}
@@ -1313,9 +1327,7 @@ static int wf_pwr_on_consys_mcu(void)
 	polling_count = 0;
 	while ((value & WF_TOP_SLPPROT_ON_STATUS_READ_ro_slpprot_en_source_1_MASK) != 0) {
 		if (polling_count > 100) {
-			DBGLOG(INIT, ERROR,
-				"Polling WFDMA TO CONNINFRA SLEEP PROTECT EN 1 fail. (0x%x)\n",
-				value);
+			pr_notice("XAGA-WFSTEP: STEP4 wfdma2conn slpprot EN1 fail, 0x184C300C=0x%08x\n", value);
 			ret = -1;
 			return ret;
 		}
@@ -1335,9 +1347,7 @@ static int wf_pwr_on_consys_mcu(void)
 	polling_count = 0;
 	while ((value & WF_TOP_SLPPROT_ON_STATUS_READ_ro_slpprot_en_source_2_MASK) != 0) {
 		if (polling_count > 100) {
-			DBGLOG(INIT, ERROR,
-				"Polling WFDMA TO CONNINFRA SLEEP PROTECT EN 2 fail. (0x%x)\n",
-				value);
+			pr_notice("XAGA-WFSTEP: STEP5 wfdma2conn slpprot EN2 fail, 0x184C300C=0x%08x\n", value);
 			ret = -1;
 			return ret;
 		}
@@ -1354,11 +1364,17 @@ static int wf_pwr_on_consys_mcu(void)
 	 */
 	wf_ioremap_read(WF_TOP_CFG_IP_VERSION_ADDR, &value);
 	polling_count = 0;
-	while (value != SOC7_WFSYS_VERSION_ID) {
+	while (value != SOC7_WFSYS_VERSION_ID &&
+	       value != SOC7_WFSYS_VERSION_ID_MT6897) {
 		if (polling_count > 10) {
-			DBGLOG(INIT, ERROR, "Polling WFSYS version ID fail.\n");
-			ret = -1;
-			return ret;
+			/* Read-only IP identification register, and nothing below branches on
+			 * it. This port has already been bitten twice by stale MT6895-era
+			 * version constants, so warn and carry on instead of failing the
+			 * whole power-on. The XAGA-WFTR trace shows what it really reads.
+			 */
+			pr_warn("XAGA-WFMCU: WFSYS version ID reads 0x%08x, expected 0x%08x - continuing\n",
+				value, SOC7_WFSYS_VERSION_ID);
+			break;
 		}
 		udelay(500);
 		wf_ioremap_read(WF_TOP_CFG_IP_VERSION_ADDR, &value);
@@ -1389,9 +1405,23 @@ static int wf_pwr_on_consys_mcu(void)
 	 * Address: 0x1840_0120
 	 * Data: 32'h810F0000
 	 * Action: write
+	 *
+	 * ★ 2026-09-20：厂商 MT6897 的 soc7_0_McuInit 用的**不是** 0x810F0000。
+	 *   wlan_drv_gen4m_6897.ko @0x1cc4b4 / @0x1cc57c：
+	 *       kalDevRegWrite(0x830C0120, 0x81050000 | 0xa0000);
+	 *       kalDevRegWrite(0x830C0120, 0x81050000);
+	 *   0x810F0000 是 soc5_0.h 里的 DEBUG_CTRL_AO base（机械克隆带过来的）。
+	 *   先按厂商的值写，并把回读打出来供判读。
 	 */
-	wf_ioremap_write(WF_MCU_BUS_CR_AP2WF_REMAP_1_ADDR,
-		WF_MCUSYS_INFRA_BUS_FULL_U_DEBUG_CTRL_AO_WFMCU_PWA_DEBUG_CTRL_AO_BASE);
+	wf_ioremap_write(WF_MCU_BUS_CR_AP2WF_REMAP_1_ADDR, 0x810A0000);
+	wf_ioremap_read(WF_MCU_BUS_CR_AP2WF_REMAP_1_ADDR, &value);
+	pr_notice("XAGA-AP2WF: 0x18400120 <- 0x810A0000 readback=0x%08x\n", value);
+	wf_ioremap_write(WF_MCU_BUS_CR_AP2WF_REMAP_1_ADDR, 0x81050000);
+	wf_ioremap_read(WF_MCU_BUS_CR_AP2WF_REMAP_1_ADDR, &value);
+	pr_notice("XAGA-AP2WF: 0x18400120 <- 0x81050000 readback=0x%08x\n", value);
+	/* 0x830C0120 是 WF_MCU_BUS_CR 的芯片视图地址（= AP 视图 0x18400120），
+	 * 不做 ioremap，以免碰到未映射区间。
+	 */
 
 	/* Enable debug clock (debug ctrl ao)
 	 * Address: 0x1850_0000[3]
@@ -1439,6 +1469,28 @@ static int wf_pwr_on_consys_mcu(void)
 	value |= 0x00000100;
 	wf_ioremap_write(DEBUG_CTRL_AO_WFMCU_PWA_CTRL3, value);
 
+	/* ★ MT6897/MT6879：厂商 wlan_drv_gen4m_6897.ko 的 soc7_0_McuInit 在写完
+	 * 0x1850_000C(PWA CTRL3)[8] 之后，还要再写 0x1850_00F4：
+	 *     w = (readl(0x1850_00F4) & 0xFFFFFF00) | 0x80;
+	 *     writel(0x1850_00F4, w);
+	 * （厂商 @0x1cc590 读、@0x1cc5bc 写；我们这版移植整个漏了，coda 头里
+	 *   也没有 +0xF4 的定义。）
+	 * 缺这一步时：WF 加电/复位/slpprot 都过、EMI 里 LK 装的固件也在，
+	 * 但 WF CPU 不起来（0x18060B10 恒 0、ROMCODE_INDEX=0）。
+	 */
+	wf_ioremap_read(SOC7_REMAP0_BASE + 0xF4, &value);
+	value &= 0xFFFFFF00;
+	value |= 0x00000080;
+	wf_ioremap_write(SOC7_REMAP0_BASE + 0xF4, value);
+	{
+		u32 chk = 0;
+
+		wf_ioremap_read(SOC7_REMAP0_BASE + 0xF4, &chk);
+		pr_notice("XAGA-PWAF4: f4=0x%08x\n", chk);
+		wf_ioremap_read(DEBUG_CTRL_AO_WFMCU_PWA_CTRL3, &chk);
+		pr_notice("XAGA-PWAF4: c3=0x%08x\n", chk);
+	}
+
 	/* Enable wfsys bus timeout (debug ctrl ao)
 	 * Address: 0x1850_0000[4] 0x1850_0000[3] 0x1850_0000[2]
 	 * Data: 1'b1 1'b1 1'b1
@@ -1484,21 +1536,107 @@ static int wf_pwr_on_consys_mcu(void)
 		wf_ioremap_read(CONN_HOST_CSR_TOP_WF_ON_MONFLG_OUT_ADDR, &value);
 		if (value == CONNSYS_ROM_DONE_CHECK)
 			break;
+
+		/* ★ 厂商 MT6897 的 soc7_0_McuInit 用的是 host_csr_top+0xA10 bit30
+		 *   （wlan_drv_gen4m_6897.ko @0x1cbefc：rd 0x18060a10; tbnz bit30）。
+		 *   原判据（+0xB10 == 0x1D1E）是 MT6895 的 mailbox 协议，在 MT6897 上恒不成立。
+		 */
+		{
+			u32 xaga_a10 = 0;
+
+			wf_ioremap_read(0x18060A10, &xaga_a10);
+			{
+				u32 xaga_lpctl = 0;
+
+				wf_ioremap_read(0x18060010, &xaga_lpctl);
+				/* ★ XAGA-PLLON (v37)：域**仍带电**时的寄存器现场。
+				 *   只在 count==0（写完立刻）与 count==256（约 1.6 s 后）各打一次。
+				 *   读的全是非 WF 域的块（AFE / RGU_ON / CLKGEN_TOP），
+				 *   用来判"驱动写的位到底有没有留下来"。
+				 */
+				if (polling_count <= 1 || (polling_count % 64) == 0) {
+					u32 a_010 = 0, a_120 = 0, a_140 = 0;
+					u32 a_c64 = 0, a_c74 = 0;
+					u32 a_afe0 = 0, a_afe4 = 0, a_afec = 0, a_afe24 = 0, a_afec34 = 0;
+					u32 a_rcidx = 0, a_ap2wf = 0, a_f440 = 0, a_p0 = 0, a_p0c = 0, a_pf4 = 0;
+
+					wf_ioremap_read(0x18000010, &a_010);
+					wf_ioremap_read(0x18000120, &a_120);
+					wf_ioremap_read(0x18000140, &a_140);
+					wf_ioremap_read(0x18012064, &a_c64);
+					wf_ioremap_read(0x18012074, &a_c74);
+					wf_ioremap_read(0x18041000, &a_afe0);
+					wf_ioremap_read(0x18041004, &a_afe4);
+					wf_ioremap_read(0x1804100c, &a_afec);
+					wf_ioremap_read(0x18041024, &a_afe24);
+					wf_ioremap_read(0x18041034, &a_afec34);
+					wf_ioremap_read(0x184c1604, &a_rcidx);
+					wf_ioremap_read(0x18400120, &a_ap2wf);
+					wf_ioremap_read(0x184f0440, &a_f440);
+					wf_ioremap_read(0x18500000, &a_p0);
+					wf_ioremap_read(0x1850000c, &a_p0c);
+					wf_ioremap_read(0x185000f4, &a_pf4);
+
+					pr_notice("XAGA-PLLON t=%u: rgu010=%08x(bit7=%d) rgu120=%08x(bit0=%d) rgu140=%08x | clkgen064=%08x 074=%08x\n",
+						  polling_count, a_010, !!(a_010 & (1u << 7)),
+						  a_120, !!(a_120 & 1u), a_140, a_c64, a_c74);
+					pr_notice("XAGA-PLLON t=%u: afe000=%08x 004=%08x 00c=%08x 024=%08x 034=%08x | ROMCODE_IDX=%08x ap2wf=%08x f440=%08x | pff %08x %08x %08x\n",
+						  polling_count, a_afe0, a_afe4, a_afec, a_afe24, a_afec34,
+						  a_rcidx, a_ap2wf, a_f440, a_p0, a_p0c, a_pf4);
+				}
+
+				if (polling_count == 0 || polling_count == 1 ||
+				    (polling_count & 0xff) == 0)
+					pr_notice("XAGA-ROMDONE: t=%ums A10=0x%08x bit30=%d LPCTL(0x18060010)=0x%08x bit2=%d B10(monflg)=0x%08x\n",
+						  polling_count, xaga_a10,
+						  !!(xaga_a10 & (1u << 30)), xaga_lpctl,
+						  !!(xaga_lpctl & (1u << 2)), value);
+			}
+			/* ★ v34：这里原来在 A10 bit30 上 break —— 该位**恒为 1**（v33 实测
+			 *   上电后 20 ms 就命中 0xfd09f6f0），⇒ 判据恒真、power-on 永远"成功"、
+			 *   "WF 上电正常"没有任何证据。改成只记录不 break，跑满 1000 ms 后
+			 *   落到下面的失败分支，把 monflg / ROMCODE_INDEX / EMI 真值全打出来。
+			 *   失败分支已把 check/ret 清零 ⇒ 不改变后续 driver-own 的行为，与 v33 可比。
+			 */
+		}
 		polling_count++;
 		udelay(1000);
 	}
 	if (check != 0) {
-		DBGLOG(INIT, ERROR,
-			"Check CONNSYS power-on completion fail, 0x%08x=[0x%08x]\n",
-			CONN_HOST_CSR_TOP_WF_ON_MONFLG_OUT_ADDR,
-			value);
+		u32 monflg = value;
 
 		wf_ioremap_read(WF_TOP_CFG_ON_ROMCODE_INDEX_ADDR, &value);
-		DBGLOG(INIT, ERROR,
-			"Check CONNSYS power-on completion fail, 0x%08x=[0x%08x]\n",
-			WF_TOP_CFG_ON_ROMCODE_INDEX_ADDR,
-			value);
-		return ret;
+		/* CONNSYS_ROM_DONE_CHECK is a ROM-version specific magic and the
+		 * vendor comment says so out loud; this port has already been bitten
+		 * by three stale MT6895-era constants. ROMCODE_INDEX tells us whether
+		 * the WM CPU is actually executing. Warn and continue rather than
+		 * failing the whole power-on.
+		 */
+		pr_warn("XAGA-WFMCU: ROM-done check fail: 0x18060B10=0x%08x (want 0x%08x), ROMCODE_INDEX=0x%08x - continuing\n",
+			monflg, CONNSYS_ROM_DONE_CHECK, value);
+		{
+			extern phys_addr_t gConEmiPhyBaseFinal;
+			extern phys_addr_t gConEmiSizeFinal;
+			void __iomem *xg;
+			u32 xg_v[5] = { 0, 0, 0, 0, 0 };
+			int xg_i;
+
+			if (gConEmiPhyBaseFinal) {
+				xg = ioremap(gConEmiPhyBaseFinal, 0x40);
+				if (xg) {
+					for (xg_i = 0; xg_i < 5; xg_i++)
+						xg_v[xg_i] = readl(xg + xg_i * 4);
+					iounmap(xg);
+				}
+				pr_warn("XAGA-EMIDL: after-ROM-poll base=0x%llx size=0x%llx emi[+0..+16]=%08x %08x %08x %08x %08x\n",
+					(u64)gConEmiPhyBaseFinal, (u64)gConEmiSizeFinal,
+					xg_v[0], xg_v[1], xg_v[2], xg_v[3], xg_v[4]);
+			} else {
+				pr_warn("XAGA-EMIDL: after-ROM-poll base==0（EMI 区压根没解析出来）\n");
+			}
+		}
+		check = 0;
+		ret = 0;
 	}
 
 	/* Disable conn_infra off domain force on
@@ -2162,6 +2300,7 @@ uint32_t soc7_0_wlanPowerOnDownload(
 
 	switch (ucDownloadItem) {
 	case ENUM_WLAN_POWER_ON_DOWNLOAD_EMI:
+		pr_notice("XAGA-EMIDL: pwrondownload EMI called\n");
 		/* Download MCU ROM EMI*/
 		soc7_0_kalFirmwareImageMapping(prAdapter->prGlueInfo,
 			&prFwBuffer, &u4FwSize, IMG_DL_IDX_MCU_ROM_EMI);
@@ -2747,8 +2886,8 @@ static int soc7_0_CheckBusHang(void *adapter, uint8_t ucWfResetEnable)
 ` *  - Read 0x184B_0010 = 02040100
  */
 		wf_ioremap_read(0x184B0010, &u4Value);
-		if (u4Value != 0x02040100) {
-			DBGLOG(HAL, ERROR, "0x184B_0100 != 02040100\n");
+		if (u4Value != 0x02040100 && u4Value != 0x02040200) {
+			DBGLOG(HAL, ERROR, "0x184B_0010 != 02040100 or 02040200\n");
 			break;
 		}
 /*

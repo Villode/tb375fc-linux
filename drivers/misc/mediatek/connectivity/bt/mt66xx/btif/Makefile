@@ -2,7 +2,11 @@
 #
 # MediaTek MT66xx Bluetooth-over-BTIF driver for the mainline xaga port.
 
+ifeq ($(CONFIG_MTK_COMBO_CHIP_CONSYS_6897),y)
+BT_PLATFORM := 6897
+else
 BT_PLATFORM := 6895
+endif
 
 ccflags-y += -D FW_LOG_DEFAULT_ON=0
 ccflags-y += -D BUILD_QA_DBG=0

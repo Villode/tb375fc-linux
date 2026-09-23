@@ -14,6 +14,7 @@
 #define pr_fmt(fmt) KBUILD_MODNAME "@(%s:%d) " fmt, __func__, __LINE__
 
 #include <linux/firmware.h>
+#include <linux/preempt.h>	/* in_atomic(): lazy conf retry must not run atomic */
 #include "conninfra_conf.h"
 
 /*******************************************************************************
@@ -615,8 +616,25 @@ int conninfra_conf_set_cfg_file(const char *name)
 	return 0;
 }
 
+static unsigned long g_conf_next_retry;
+
 const struct conninfra_conf *conninfra_conf_get_cfg(void)
 {
+	/* conninfra_conf_init() first runs from an early initcall, while the root
+	 * is still the initramfs, so /lib/firmware/conninfra.cfg cannot be found
+	 * and cfg_exist stays 0 forever. The real root only shows up once the
+	 * initramfs has mounted it and switch_root'd into it (~14-25 s here),
+	 * so retry on a time window instead of a small attempt count - consumers
+	 * such as POS need the config much later than the first probe attempt.
+	 */
+	if (g_conninfra_conf.cfg_exist == 0 && !in_atomic() &&
+	    time_after_eq(jiffies, g_conf_next_retry) &&
+	    time_before(jiffies, msecs_to_jiffies(120000))) {
+		g_conf_next_retry = jiffies + msecs_to_jiffies(4000);
+		if (conninfra_conf_init() == 0)
+			pr_notice("XAGA-CONFCFG: loaded on lazy retry\n");
+	}
+
 	if (g_conninfra_conf.cfg_exist == 0)
 		return NULL;
 

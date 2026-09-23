@@ -4138,7 +4138,10 @@ static int main_exit(void)
  * program it into the controller from bt_setup() after the BTIF transport is
  * opened.
  */
-#define BT_ADDR_FIRMWARE "mediatek/mt6895/BT_Addr"
+/* ★ v34：原为 mt6895（克隆残留）。BT probe 在 12.4 s，早于真实根挂载，
+ *   所以这个文件同时被 initramfs 提供在 /lib/firmware/mediatek/mt6897/。
+ */
+#define BT_ADDR_FIRMWARE "mediatek/mt6897/BT_Addr"
 
 /*
  * Auto power-on the local HCI device shortly after registration.  This runs

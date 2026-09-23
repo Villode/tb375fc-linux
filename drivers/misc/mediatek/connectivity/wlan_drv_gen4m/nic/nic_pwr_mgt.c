@@ -144,7 +144,10 @@ void nicpmSetFWOwn(IN struct ADAPTER *prAdapter,
 /*----------------------------------------------------------------------------*/
 u_int8_t nicpmSetDriverOwn(IN struct ADAPTER *prAdapter)
 {
-	return halSetDriverOwn(prAdapter);
+	u_int8_t xaga_r = halSetDriverOwn(prAdapter);
+
+	pr_notice("XAGA-OWN: nicpmSetDriverOwn ret=%d\n", (int)xaga_r);
+	return xaga_r;
 }
 
 /*----------------------------------------------------------------------------*/

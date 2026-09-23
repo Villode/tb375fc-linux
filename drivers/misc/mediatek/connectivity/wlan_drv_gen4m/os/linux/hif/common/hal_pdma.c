@@ -512,6 +512,8 @@ u_int8_t halSetDriverOwn(IN struct ADAPTER *prAdapter)
 		return fgStatus;
 
 	DBGLOG(INIT, TRACE, "DRIVER OWN Start\n");
+	pr_notice("XAGA-OWN: halSetDriverOwn enter fgIsFwOwn=%d\n",
+		  (int)prAdapter->fgIsFwOwn);
 	KAL_REC_TIME_START();
 
 	u4CurrTick = kalGetTimeTick();
@@ -521,10 +523,89 @@ u_int8_t halSetDriverOwn(IN struct ADAPTER *prAdapter)
 	HAL_LP_OWN_CLR(prAdapter, &fgResult);
 	fgResult = FALSE;
 
+	/* ★ v33（2026-09-20）：厂商 halSetDriverOwn(@0x10c278) 在进轮询循环**之前**
+	 *   就写了一次 `bus_info->fw_own_clear_addr / fw_own_clear_bit`
+	 *   （厂商 BUS_INFO 实例 @0x320348：+0x54=0x7c060014、+0x58=1，
+	 *    与我们这两个字段一致）；我们只在**成功分支**里写。
+	 *   这里补上，并顺手试一次厂商 dump 用过的 0xB04 命令 0x1d。
+	 */
+	if (prBusInfo->fw_own_clear_addr) {
+		HAL_MCR_WR(prAdapter, prBusInfo->fw_own_clear_addr,
+			   prBusInfo->fw_own_clear_bit);
+		pr_notice("XAGA-OWN: pre-write fw_own_clear addr=0x%x bit=0x%x\n",
+			  prBusInfo->fw_own_clear_addr,
+			  prBusInfo->fw_own_clear_bit);
+	}
+	{
+		uint32_t xaga_v = 0;
+
+		HAL_MCR_RD(prAdapter, 0x18060B10, &xaga_v);
+		pr_notice("XAGA-OWN: before 0xB04=0x1d, 0xB10=0x%08x\n", xaga_v);
+		HAL_MCR_WR(prAdapter, 0x18060B04, 0x1d);
+		xaga_v = 0;
+		HAL_MCR_RD(prAdapter, 0x18060B10, &xaga_v);
+		pr_notice("XAGA-OWN: after  0xB04=0x1d, 0xB10=0x%08x\n", xaga_v);
+	}
+
+		/* ★ XAGA-LPCTLW2 (v41)：区分「寄存器不可写」vs「写生效但硬件重置位」。
+	 *   方法：写硬件不驱动的空闲位（bit16 / bit3），看是否粘住。
+	 *   0x18060014 作为阳性对照（驱动自己把它当 fw_own_clear 写）。
+	 */
+	{
+		uint32_t w16 = 0, r16 = 0, w3 = 0, r3 = 0, w8 = 0, r8 = 0;
+		uint32_t ctl_b = 0, ctl_a = 0, b1 = 0, b0 = 0;
+
+		/* 阳性对照：IRQ_STAT 写 1 再读 */
+		HAL_MCR_RD(prAdapter, 0x18060014, &ctl_b);
+		HAL_MCR_WR(prAdapter, 0x18060014, 0x1);
+		HAL_MCR_RD(prAdapter, 0x18060014, &ctl_a);
+		pr_notice("XAGA-LPCTLW2: CTRL 0x18060014 before=%08x after_wr1=%08x\n", ctl_b, ctl_a);
+
+		/* 可写性：空闲位 bit16 / bit3 / bit8 */
+		HAL_MCR_WR(prAdapter, 0x7C060010, 0x00010000);
+		HAL_MCR_RD(prAdapter, 0x7C060010, &r16);
+		HAL_MCR_WR(prAdapter, 0x7C060010, 0x00000008);
+		HAL_MCR_RD(prAdapter, 0x7C060010, &r3);
+		HAL_MCR_WR(prAdapter, 0x7C060010, 0x00000100);
+		HAL_MCR_RD(prAdapter, 0x7C060010, &r8);
+		w16 = r16; w3 = r3; w8 = r8;
+		pr_notice("XAGA-LPCTLW2: LPCTL write_bit16 -> read %08x | write_bit3 -> read %08x | write_bit8 -> read %08x\n",
+			  w16, w3, w8);
+		/* 粘住 = 读回的对应位为 1 */
+		pr_notice("XAGA-LPCTLW2: sticky? bit16=%d bit3=%d bit8=%d (1=粘住/可写)\n",
+			  !!(w16 & 0x00010000), !!(w3 & 0x8), !!(w8 & 0x100));
+
+		/* own 位本身 */
+		HAL_MCR_WR(prAdapter, 0x7C060010, 0x2);
+		HAL_MCR_RD(prAdapter, 0x7C060010, &b1);
+		HAL_MCR_WR(prAdapter, 0x7C060010, 0x1);
+		HAL_MCR_RD(prAdapter, 0x7C060010, &b0);
+		pr_notice("XAGA-LPCTLW2: after_clr(bit1)=%08x after_set(bit0)=%08x (bit2 stays 1?  %d %d)\n",
+			  b1, b0, !!(b1 & 0x4), !!(b0 & 0x4));
+		/* 恢复：把 own 交回 FW */
+		HAL_MCR_WR(prAdapter, 0x7C060010, 0x2);
+	}
+
 	while (1) {
 		if (!prBusInfo->fgCheckDriverOwnInt ||
 		    test_bit(GLUE_FLAG_INT_BIT, &prAdapter->prGlueInfo->ulFlag))
 			HAL_LP_OWN_RD(prAdapter, &fgResult);
+
+		{
+			static uint32_t xaga_last_ms;
+			uint32_t xaga_now = kalGetTimeTick();
+
+			if (xaga_now - xaga_last_ms >= 250) {
+				uint32_t xaga_v = 0xdeadbeef;
+				/* 厂商 asicConnac2xLowPowerOwnRead 读的就是这个地址 */
+				HAL_MCR_RD(prAdapter, 0x7C060010, &xaga_v);
+				xaga_last_ms = xaga_now;
+				pr_notice("XAGA-OWN: t=%ums i=%u fgResult=%d LPCTL(0x7C060010)=0x%08x bit2=%d\n",
+					  (unsigned)(xaga_now - u4CurrTick),
+					  (unsigned)i, (int)fgResult, xaga_v,
+					  !!(xaga_v & 0x4));
+			}
+		}
 
 		fgTimeout = ((kalGetTimeTick() - u4CurrTick) >
 			     LP_OWN_BACK_TOTAL_DELAY_MS) ? TRUE : FALSE;
@@ -547,6 +628,16 @@ u_int8_t halSetDriverOwn(IN struct ADAPTER *prAdapter)
 		} else if ((i > LP_OWN_BACK_FAILED_RETRY_CNT) &&
 			   (kalIsCardRemoved(prAdapter->prGlueInfo) ||
 			    fgIsBusAccessFailed || fgTimeout)) {
+			{
+				uint32_t xaga_v = 0xdeadbeef;
+
+				HAL_MCR_RD(prAdapter, 0x7C060010, &xaga_v);
+				pr_notice("XAGA-OWN: TIMEOUT after %ums i=%u fgTimeout=%d LPCTL=0x%08x bit2=%d fgIsFwOwn=%d\n",
+					  (unsigned)(kalGetTimeTick() - u4CurrTick),
+					  (unsigned)i, (int)fgTimeout, xaga_v,
+					  !!(xaga_v & 0x4),
+					  (int)prAdapter->fgIsFwOwn);
+			}
 			halDriverOwnTimeout(prAdapter, u4CurrTick, fgTimeout);
 			fgStatus = FALSE;
 			break;
@@ -596,6 +687,8 @@ u_int8_t halSetDriverOwn(IN struct ADAPTER *prAdapter)
 /*----------------------------------------------------------------------------*/
 void halSetFWOwn(IN struct ADAPTER *prAdapter, IN u_int8_t fgEnableGlobalInt)
 {
+	pr_notice("XAGA-OWN: halSetFWOwn enter fgEnableGlobalInt=%d fgIsFwOwn=%d\n",
+		  (int)fgEnableGlobalInt, (int)prAdapter->fgIsFwOwn);
 	struct BUS_INFO *prBusInfo;
 	struct GL_HIF_INFO *prHifInfo;
 	u_int8_t fgResult;

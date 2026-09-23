@@ -1068,6 +1068,12 @@ skip:
 	return fgRet;
 }
 
+/* The WLAN driver's own DBGLOG is compiled out in this build (DBG_DISABLE_ALL_LOG),
+ * so the WM-MCU power-on polls are silent when they time out. This bounded trace
+ * prints each CR access; wf_pwr_on_consys_mcu() arms the budget on entry.
+ */
+int xaga_wf_trace_left;
+
 int wf_ioremap_read(phys_addr_t addr, unsigned int *val)
 {
 	void *vir_addr = NULL;
@@ -1082,6 +1088,26 @@ int wf_ioremap_read(phys_addr_t addr, unsigned int *val)
 	*val = readl(vir_addr);
 	iounmap(vir_addr);
 	DBGLOG(INIT, TRACE, "Read CONSYS 0x%08x=0x%08x.\n", addr, *val);
+	if (xaga_wf_trace_left > 0) {
+		static u32 xaga_last_addr = ~0u;
+		static u32 xaga_last_val;
+		static u32 xaga_repeat;
+
+		if (xaga_last_addr == (u32)addr && xaga_last_val == *val) {
+			xaga_repeat++;
+		} else {
+			if (xaga_repeat) {
+				pr_notice("XAGA-WFTR:   ^ (repeat x%u)\n", xaga_repeat);
+				xaga_wf_trace_left--;
+			}
+			xaga_last_addr = (u32)addr;
+			xaga_last_val = *val;
+			xaga_repeat = 0;
+			pr_notice("XAGA-WFTR: rd 0x%08x = 0x%08x%s\n", (u32)addr, *val,
+				*val == HIF_DEADFEED_VALUE ? " <-DEADFEED(域未上电)" : "");
+			xaga_wf_trace_left--;
+		}
+	}
 
 	return 0;
 }
@@ -1100,6 +1126,17 @@ int wf_ioremap_write(phys_addr_t addr, unsigned int val)
 	writel(val, vir_addr);
 	iounmap(vir_addr);
 	DBGLOG(INIT, TRACE, "Write CONSYS 0x%08x=0x%08x.\n", addr, val);
+	if (xaga_wf_trace_left > 0) {
+		static u32 xaga_last_waddr = ~0u;
+		static u32 xaga_last_wval;
+
+		if (xaga_last_waddr != (u32)addr || xaga_last_wval != val) {
+			xaga_last_waddr = (u32)addr;
+			xaga_last_wval = val;
+			pr_notice("XAGA-WFTR: wr 0x%08x = 0x%08x\n", (u32)addr, val);
+			xaga_wf_trace_left--;
+		}
+	}
 
 	return 0;
 }

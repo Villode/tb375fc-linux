@@ -157,7 +157,18 @@ module_param_named(ap, gprifnameap, charp, 0000);
 #define CUSTOM_IFNAMESIZ 5
 #endif /* CFG_DRIVER_INF_NAME_CHANGE */
 
-uint8_t aucDebugModule[DBG_MODULE_NUM];
+/* DBGLOG is compiled in but gated per module; vendor default is all-zero == silent.
+ * Open up only the bring-up path so dmesg keeps the scene for us.
+ * Runtime knob: /proc/sys/net/wlan/dbgLevel (wlanSetDriverDbgLevel).
+ */
+uint8_t aucDebugModule[DBG_MODULE_NUM] = {
+	[DBG_INIT_IDX]  = DBG_CLASS_ERROR | DBG_CLASS_WARN | DBG_CLASS_STATE |
+			DBG_CLASS_INFO,
+	[DBG_HAL_IDX]   = DBG_CLASS_ERROR | DBG_CLASS_WARN | DBG_CLASS_STATE |
+			DBG_CLASS_INFO,
+	[DBG_INTR_IDX]  = DBG_CLASS_ERROR | DBG_CLASS_WARN | DBG_CLASS_STATE |
+			DBG_CLASS_INFO,
+};
 uint32_t au4LogLevel[ENUM_WIFI_LOG_MODULE_NUM] = { ENUM_WIFI_LOG_LEVEL_DEFAULT };
 
 /* 4 2007/06/26, mikewu, now we don't use this, we just fix the number of wlan
@@ -1815,11 +1826,19 @@ void wlanDebugInit(void)
 	/* enable all */
 	wlanSetDriverDbgLevel(DBG_ALL_MODULE_IDX, DBG_CLASS_MASK);
 #else
-#ifdef CFG_DEFAULT_DBG_LEVEL
-	wlanSetDriverDbgLevel(DBG_ALL_MODULE_IDX, CFG_DEFAULT_DBG_LEVEL);
-#else
-	wlanSetDriverDbgLevel(DBG_ALL_MODULE_IDX, DBG_LOG_LEVEL_DEFAULT);
-#endif
+	/* ★ 2026-09-20 TB375FC：原来无条件
+	 *     wlanSetDriverDbgLevel(DBG_ALL_MODULE_IDX, DBG_LOG_LEVEL_DEFAULT);
+	 *   而 DBG_LOG_LEVEL_DEFAULT == DBG_CLASS_ERROR ⇒ 运行期把本文件
+	 *   `aucDebugModule[]` 的初值**全部覆盖成 ERROR**，STATE/INFO/TRACE 全丢，
+	 *   bring-up 叙述（halSetDriverOwn / halDownloadFw / halSetFWOwn）看不到。
+	 *   这里只给关心的三个模块放开全部等级，其余保持 0（避免 SW4 等刷屏）。
+	 */
+#define XAGA_DBG_LEVELS (DBG_CLASS_ERROR | DBG_CLASS_WARN | \
+			 DBG_CLASS_STATE | DBG_CLASS_INFO | DBG_CLASS_TRACE)
+
+	wlanSetDriverDbgLevel(DBG_INIT_IDX, XAGA_DBG_LEVELS);
+	wlanSetDriverDbgLevel(DBG_HAL_IDX, XAGA_DBG_LEVELS);
+	wlanSetDriverDbgLevel(DBG_INTR_IDX, XAGA_DBG_LEVELS);
 #endif /* DBG */
 
 	LOG_FUNC("Reset ALL DBG module log level to DEFAULT!");
@@ -2465,7 +2484,11 @@ enum ENUM_NVRAM_STATE wlanNvramGetState(void)
 	return g_NvramFsm;
 }
 
+#if IS_ENABLED(CONFIG_MTK_COMBO_WIFI_6897)
+#define XAGA_WIFI_NVRAM_FW "mediatek/mt6897/WIFI"
+#else
 #define XAGA_WIFI_NVRAM_FW "mediatek/mt6895/WIFI"
+#endif
 
 static int wlanLoadNvramFirmware(struct device *dev)
 {
@@ -5230,6 +5253,7 @@ static int32_t wlanOnAtReset(void)
 		/* wlanAdapterStart Section Start */
 		rStatus = wlanAdapterStart(prAdapter, &prGlueInfo->rRegInfo,
 					   TRUE);
+		pr_notice("XAGA-ADP: wlanAdapterStart ret=%d\n", (int)rStatus);
 		if (rStatus != WLAN_STATUS_SUCCESS) {
 			eFailReason = ADAPTER_START_FAIL;
 			break;

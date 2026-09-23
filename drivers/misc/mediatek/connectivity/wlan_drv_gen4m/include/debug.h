@@ -68,10 +68,20 @@
  *******************************************************************************
  */
 #ifndef BUILD_QA_DBG
-#define BUILD_QA_DBG 0
+/* ★ 2026-09-20：=0 时 `kalPrint` 是空宏（gl_kal.h:931-935），
+ *   于是**所有 DBGLOG 都被编译成空语句** —— 与 DBG_DISABLE_ALL_LOG、
+ *   aucDebugModule[] 都无关。厂商日志里有 `[wlan][PID]func:(INIT INFO) ...`
+ *   ⇒ 厂商是 1。打开它，驱动才会自己讲 bring-up 走到哪一步。
+ *   日志量由 aucDebugModule[]（gl_init.c）控制，当前只开了 INIT/HAL/INTR。
+ */
+#define BUILD_QA_DBG 1
 #endif
 
-#define DBG_DISABLE_ALL_LOG             1
+#define DBG_DISABLE_ALL_LOG             0
+/* TB375FC: =1 turns every DBGLOG() in the WLAN core into an empty macro, which is
+ * why the driver probe path is completely silent in dmesg. Runtime gating via
+ * aucDebugModule[] (initialised in gl_init.c) is what keeps the log volume sane.
+ */
 
 /*******************************************************************************
  *                    E X T E R N A L   R E F E R E N C E S

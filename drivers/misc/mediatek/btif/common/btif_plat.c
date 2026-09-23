@@ -13,6 +13,15 @@
 #include "btif_pub.h"
 #include "btif_priv.h"
 #include "mtk_btif.h"
+/*
+ * TB375FC mainline: the MT6897 pericfg-AO clock driver does not exist yet,
+ * so the "btifc"/"apdmac" gates cannot be resolved from CCF.  Treat them as
+ * default-on (the vendor kernel drives this IP without a btif DT node too)
+ * and keep the clock helpers from dereferencing a NULL clk.
+ */
+#define BTIF_CLK_SAFE_ENABLE(c)  ((c) ? clk_enable(c) : 0)
+#define BTIF_CLK_SAFE_DISABLE(c) do { if (c) clk_disable(c); } while (0)
+
 
 #define BTIF_USER_ID "btif_driver"
 
@@ -276,34 +285,45 @@ struct _MTK_BTIF_INFO_STR_ *hal_btif_info_get(void)
 #if !defined(CONFIG_MTK_CLKMGR)
 int hal_btif_clk_get_and_prepare(struct platform_device *pdev)
 {
-		int i_ret = -1;
+		int i_ret = 0;
 
+		/*
+		 * TB375FC mainline: there is no pericfg-AO clock driver for MT6897
+		 * yet, so "btifc"/"apdmac" cannot be resolved.  The vendor kernel
+		 * runs this IP without the CCF as well (the vendor DT has no btif
+		 * node), so treat the gates as default-on instead of failing the
+		 * probe (which used to leave btif_probed == 0 and froze BTIF_init
+		 * forever).  Once a pericfg clock driver lands, add the clocks to
+		 * the btif node and this code picks them up again.
+		 */
 		clk_btif = devm_clk_get(&pdev->dev, "btifc");
 		if (IS_ERR(clk_btif)) {
-			BTIF_ERR_FUNC("[CCF]cannot get clk_btif clock.\n");
-			return PTR_ERR(clk_btif);
+			BTIF_ERR_FUNC("[CCF]cannot get clk_btif clock(%ld), assume default-on\n",
+					PTR_ERR(clk_btif));
+			clk_btif = NULL;
+		} else {
+			i_ret = clk_prepare(clk_btif);
+			if (i_ret != 0) {
+				BTIF_ERR_FUNC("clk_prepare failed! ret:%d\n", i_ret);
+				return i_ret;
+			}
 		}
-		BTIF_ERR_FUNC("[CCF]clk_btif=%p\n", clk_btif);
+
 		clk_btif_apdma = devm_clk_get(&pdev->dev, "apdmac");
 		if (IS_ERR(clk_btif_apdma)) {
-			BTIF_ERR_FUNC("[CCF]can't get clk_btif_apdma clock.\n");
-			return PTR_ERR(clk_btif_apdma);
+			BTIF_ERR_FUNC("[CCF]can't get clk_btif_apdma clock(%ld), assume default-on\n",
+					PTR_ERR(clk_btif_apdma));
+			clk_btif_apdma = NULL;
+		} else {
+			i_ret = clk_prepare(clk_btif_apdma);
+			if (i_ret != 0) {
+				BTIF_ERR_FUNC("clk_prepare failed! ret:%d\n", i_ret);
+				return i_ret;
+			}
 		}
-		BTIF_ERR_FUNC("[CCF]clk_btif_apdma=%p\n", clk_btif_apdma);
-
-		i_ret = clk_prepare(clk_btif);
-		if (i_ret != 0) {
-			BTIF_ERR_FUNC("clk_prepare failed! ret:%d\n", i_ret);
-			return i_ret;
-		}
-
-		i_ret = clk_prepare(clk_btif_apdma);
-		if (i_ret != 0) {
-			BTIF_ERR_FUNC("clk_prepare failed! ret:%d\n", i_ret);
-			return i_ret;
-		}
-		return i_ret;
+		return 0;
 }
+
 /*****************************************************************************
  * FUNCTION
  *  hal_btif_clk_unprepare
@@ -316,8 +336,10 @@ int hal_btif_clk_get_and_prepare(struct platform_device *pdev)
  *****************************************************************************/
 int hal_btif_clk_unprepare(void)
 {
-	clk_unprepare(clk_btif);
-	clk_unprepare(clk_btif_apdma);
+	if (clk_btif)
+		clk_unprepare(clk_btif);
+	if (clk_btif_apdma)
+		clk_unprepare(clk_btif_apdma);
 	return 0;
 }
 #endif
@@ -358,7 +380,7 @@ int hal_btif_clk_ctrl(struct _MTK_BTIF_INFO_STR_ *p_btif,
 			i_ret = enable_clock(MTK_BTIF_CG_BIT, BTIF_USER_ID);
 #else
 			BTIF_DBG_FUNC("[CCF]enable clk_btif\n");
-			i_ret = clk_enable(clk_btif);
+			i_ret = BTIF_CLK_SAFE_ENABLE(clk_btif);
 #endif /* defined(CONFIG_MTK_CLKMGR) */
 			if (i_ret) {
 				BTIF_WARN_FUNC
@@ -374,8 +396,8 @@ int hal_btif_clk_ctrl(struct _MTK_BTIF_INFO_STR_ *p_btif,
 					("disable_clock failed, ret:%d", i_ret);
 			}
 #else
-			BTIF_DBG_FUNC("[CCF] clk_disable(clk_btif) calling\n");
-			clk_disable(clk_btif);
+			BTIF_DBG_FUNC("[CCF] BTIF_CLK_SAFE_DISABLE(clk_btif) calling\n");
+			BTIF_CLK_SAFE_DISABLE(clk_btif);
 #endif /* defined(CONFIG_MTK_CLKMGR) */
 		}
 	} else {
@@ -396,7 +418,7 @@ int hal_btif_clk_ctrl(struct _MTK_BTIF_INFO_STR_ *p_btif,
 			i_ret = enable_clock(MTK_BTIF_CG_BIT, BTIF_USER_ID);
 #else
 			BTIF_DBG_FUNC("[CCF]enable clk_btif\n");
-			i_ret = clk_enable(clk_btif);
+			i_ret = BTIF_CLK_SAFE_ENABLE(clk_btif);
 #endif /* defined(CONFIG_MTK_CLKMGR) */
 			status = (i_ret == 0) ? flag : status;
 			if (i_ret) {
@@ -412,8 +434,8 @@ int hal_btif_clk_ctrl(struct _MTK_BTIF_INFO_STR_ *p_btif,
 					("disable_clock failed, ret:%d", i_ret);
 			}
 #else
-			BTIF_DBG_FUNC("[CCF] clk_disable(clk_btif) calling\n");
-			clk_disable(clk_btif);
+			BTIF_DBG_FUNC("[CCF] BTIF_CLK_SAFE_DISABLE(clk_btif) calling\n");
+			BTIF_CLK_SAFE_DISABLE(clk_btif);
 #endif /* defined(CONFIG_MTK_CLKMGR) */
 		} else {
 			i_ret = ERR_INVALID_PAR;

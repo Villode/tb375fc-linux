@@ -457,9 +457,14 @@ uint32_t wlanDownloadEMISection(IN struct ADAPTER
 	uint8_t __iomem *pucEmiBaseAddr = NULL;
 	uint32_t u4Offset = u4DestAddr & WIFI_EMI_ADDR_MASK;
 
+	pr_notice("XAGA-EMIDL: enter dest=0x%08x off=0x%x len=%u base=0x%llx size=0x%llx\n",
+		  u4DestAddr, u4Offset, u4Len,
+		  (u64)gConEmiPhyBaseFinal, (u64)gConEmiSizeFinal);
+
 	if (!gConEmiPhyBaseFinal) {
 		DBGLOG(INIT, ERROR,
 		       "Consys emi memory address gConEmiPhyBaseFinal invalid\n");
+		pr_notice("XAGA-EMIDL: BAIL gConEmiPhyBaseFinal==0\n");
 		return WLAN_STATUS_FAILURE;
 	}
 
@@ -476,6 +481,11 @@ uint32_t wlanDownloadEMISection(IN struct ADAPTER
 	}
 
 	kalMemCopyToIo((pucEmiBaseAddr + u4Offset), pucStartPtr, u4Len);
+
+	pr_notice("XAGA-EMIDL: copied %u bytes -> phys 0x%llx; readback[0]=0x%08x src[0]=0x%08x\n",
+		  u4Len, (u64)(gConEmiPhyBaseFinal + u4Offset),
+		  readl(pucEmiBaseAddr + u4Offset),
+		  ((u32 *)pucStartPtr)[0]);
 
 	kalSetEmiMpuProtection(gConEmiPhyBaseFinal, true);
 	iounmap(pucEmiBaseAddr);

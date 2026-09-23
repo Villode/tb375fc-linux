@@ -12,6 +12,15 @@
 
 #include "btif_dma_priv.h"
 #include "mtk_btif.h"
+/*
+ * TB375FC mainline: the MT6897 pericfg-AO clock driver does not exist yet,
+ * so the "btifc"/"apdmac" gates cannot be resolved from CCF.  Treat them as
+ * default-on (the vendor kernel drives this IP without a btif DT node too)
+ * and keep the clock helpers from dereferencing a NULL clk.
+ */
+#define BTIF_CLK_SAFE_ENABLE(c)  ((c) ? clk_enable(c) : 0)
+#define BTIF_CLK_SAFE_DISABLE(c) do { if (c) clk_disable(c); } while (0)
+
 
 #define DMA_USER_ID "btif_driver"
 
@@ -283,7 +292,7 @@ int hal_btif_dma_clk_ctrl(struct _MTK_DMA_INFO_STR_ *p_dma_info,
 					DMA_USER_ID);
 #else
 			BTIF_DBG_FUNC("[CCF]enable clk_btif_apdma\n");
-			i_ret = clk_enable(clk_btif_apdma);
+			i_ret = BTIF_CLK_SAFE_ENABLE(clk_btif_apdma);
 #endif /* defined(CONFIG_MTK_CLKMGR) */
 			if (i_ret) {
 				BTIF_WARN_FUNC
@@ -300,8 +309,8 @@ int hal_btif_dma_clk_ctrl(struct _MTK_DMA_INFO_STR_ *p_dma_info,
 					("disable_clock failed, ret:%d", i_ret);
 			}
 #else
-			BTIF_DBG_FUNC("clk_disable(clk_btif_apdma) calling\n");
-			clk_disable(clk_btif_apdma);
+			BTIF_DBG_FUNC("BTIF_CLK_SAFE_DISABLE(clk_btif_apdma) calling\n");
+			BTIF_CLK_SAFE_DISABLE(clk_btif_apdma);
 #endif /* defined(CONFIG_MTK_CLKMGR) */
 		}
 	} else {
@@ -323,7 +332,7 @@ int hal_btif_dma_clk_ctrl(struct _MTK_DMA_INFO_STR_ *p_dma_info,
 					DMA_USER_ID);
 #else
 			BTIF_DBG_FUNC("[CCF]enable clk_btif_apdma\n");
-			i_ret = clk_enable(clk_btif_apdma);
+			i_ret = BTIF_CLK_SAFE_ENABLE(clk_btif_apdma);
 #endif /* defined(CONFIG_MTK_CLKMGR) */
 			status = (i_ret == 0) ? flag : status;
 			if (i_ret) {
@@ -340,8 +349,8 @@ int hal_btif_dma_clk_ctrl(struct _MTK_DMA_INFO_STR_ *p_dma_info,
 					("disable_clock failed, ret:%d", i_ret);
 			}
 #else
-			BTIF_DBG_FUNC("clk_disable(clk_btif_apdma) calling\n");
-			clk_disable(clk_btif_apdma);
+			BTIF_DBG_FUNC("BTIF_CLK_SAFE_DISABLE(clk_btif_apdma) calling\n");
+			BTIF_CLK_SAFE_DISABLE(clk_btif_apdma);
 #endif /* defined(CONFIG_MTK_CLKMGR) */
 		} else {
 			i_ret = ERR_INVALID_PAR;

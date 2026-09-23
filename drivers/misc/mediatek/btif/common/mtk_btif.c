@@ -9,6 +9,7 @@
 #include <linux/device.h>
 #include <linux/errno.h>
 #include <linux/platform_device.h>
+#include <linux/of.h>
 #include <linux/fs.h>
 #include <linux/cdev.h>
 #include <linux/poll.h>
@@ -3262,6 +3263,24 @@ static int BTIF_init(void)
 	BTIF_DBG_FUNC("++\n");
 
 /*Platform Driver initialization*/
+	/*
+	 * TB375FC mainline: neither the vendor DT nor ours has a "mediatek,btif"
+	 * node, and the USE_DEVICE_NODE=0 path in bt/mt66xx/btif only creates the
+	 * "mtkbt_btif" device with a .probe = NULL driver, so mtk_btif_probe()
+	 * would never run and the wait below would never end (the whole boot
+	 * froze right after "loop: module loaded" because of this).  Register
+	 * the device by name here so driver_register probes it synchronously;
+	 * missing clocks are tolerated in hal_btif_clk_get_and_prepare().
+	 */
+	if (!of_find_compatible_node(NULL, NULL, "mediatek,btif")) {
+		struct platform_device *btif_pdev =
+			platform_device_register_simple(DRV_NAME, -1, NULL, 0);
+
+		if (IS_ERR(btif_pdev))
+			BTIF_ERR_FUNC("register %s device failed(%ld)\n",
+					DRV_NAME, PTR_ERR(btif_pdev));
+	}
+
 	i_ret = platform_driver_register(&mtk_btif_dev_drv);
 	if (i_ret) {
 		BTIF_ERR_FUNC("registered failed, ret(%d)\n", i_ret);
@@ -3273,9 +3292,30 @@ static int BTIF_init(void)
 		BTIF_ERR_FUNC("BTIF pdriver_create_file failed, ret(%d)\n",
 				i_ret);
 
-	/* we keep waiting because KE happens if probe function is not called. */
-	while (btif_probed == 0)
-		msleep(500);
+	/* we keep waiting because KE happens if probe function is not called.
+	 * TB375FC mainline: with the device registered above the probe runs
+	 * synchronously inside platform_driver_register(), so this exits at
+	 * once; the bound (60 x 500ms) only guards against a probe that fails
+	 * for an unexpected reason -- never freeze the whole boot here.
+	 */
+	{
+		int wait_cnt = 0;
+
+		while (btif_probed == 0 && wait_cnt < 60) {
+			msleep(500);
+			wait_cnt++;
+			if (wait_cnt == 2)
+				BTIF_ERR_FUNC("btif probe not seen yet (%d/60)\n",
+						wait_cnt);
+		}
+	}
+	if (btif_probed == 0) {
+		BTIF_ERR_FUNC("btif platform probe never ran, abort BTIF init\n");
+		driver_remove_file(&mtk_btif_dev_drv.driver, &driver_attr_flag);
+		platform_driver_unregister(&mtk_btif_dev_drv);
+		i_ret = -ENODEV;
+		goto err_exit1;
+	}
 
 /*SW init*/
 	for (index = 0; index < BTIF_PORT_NR; index++) {

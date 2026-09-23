@@ -273,6 +273,8 @@ static int hifAxiProbe(void)
 
 	prDriverData = get_platform_driver_data();
 	prChipInfo = prDriverData->chip_info;
+	pr_notice("XAGA-HIFPROBE: enter plat_dev=%p chip_info=%p\n",
+			g_prPlatDev, prChipInfo);
 
 #if CFG_MTK_ANDROID_WMT
 #if (CFG_SUPPORT_CONNINFRA == 0)
@@ -285,6 +287,7 @@ static int hifAxiProbe(void)
 #endif
 	ret = asicConnac2xPwrOnWmMcu(prChipInfo);
 	if (ret != 0) {
+		pr_notice("XAGA-HIFPROBE: asicConnac2xPwrOnWmMcu fail ret=%d\n", ret);
 		asicConnac2xPwrOffWmMcu(prChipInfo);
 		goto out;
 	}
@@ -294,6 +297,7 @@ static int hifAxiProbe(void)
 	if (pfWlanProbe((void *) g_prPlatDev, (void *) prDriverData) !=
 			WLAN_STATUS_SUCCESS) {
 		DBGLOG(INIT, INFO, "pfWlanProbe fail!\n");
+		pr_notice("XAGA-HIFPROBE: pfWlanProbe fail\n");
 		ret = -1;
 #if CFG_MTK_ANDROID_WMT
 #if (CFG_SUPPORT_CONNINFRA == 1)
@@ -306,6 +310,7 @@ static int hifAxiProbe(void)
 
 out:
 	DBGLOG(INIT, TRACE, "hifAxiProbe() done(%d)\n", ret);
+	pr_notice("XAGA-HIFPROBE: done ret=%d\n", ret);
 
 	return ret;
 }

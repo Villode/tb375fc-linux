@@ -11,7 +11,11 @@ KBUILD_MODPOST_FAIL_ON_WARNINGS := y
 ###############################################################################
 # Option for some ALPS specific feature, ex: AEE.
 ccflags-y += -D CONNINFRA_PLAT_ALPS=1
-ccflags-y += -D MTK_CONNINFRA_CLOCK_BUFFER_API_AVAILABLE=1
+ccflags-y += -D MTK_CONNINFRA_CLOCK_BUFFER_API_AVAILABLE=0
+# ^ TB375FC: =1 makes POS's conn-infra power step a bare pm_runtime_get_sync(),
+#   which does nothing because the consys device has no runtime PM bound.
+#   =0 selects consys_conninfra_on_power_ctrl_mt6897_gen(), the vendor's
+#   raw SPM CONN_PWR_CON sequence. Re-verify before flipping back.
 ccflags-y += -DCONFIG_MTK_CONNSYS_DEDICATED_LOG_PATH
 # Mainline built-in mode: auto-start all connectivity sub-drivers from
 # conninfra after the consys platform device has probed.
@@ -112,6 +116,13 @@ ifeq ($(CONFIG_MTK_COMBO_CHIP_CONSYS_6895),y)
 ifneq ($(wildcard $(PATH_TO_CONNINFRA_DRV)/platform/mt6895),)
 ccflags-y += -I$(KO_CODE_PATH)/platform/mt6895/include
 ccflags-y += -I$(KO_CODE_PATH)/platform/mt6895/include/CODA
+endif
+endif
+
+ifeq ($(CONFIG_MTK_COMBO_CHIP_CONSYS_6897),y)
+ifneq ($(wildcard $(PATH_TO_CONNINFRA_DRV)/platform/mt6897),)
+ccflags-y += -I$(KO_CODE_PATH)/platform/mt6897/include
+ccflags-y += -I$(KO_CODE_PATH)/platform/mt6897/include/CODA
 endif
 endif
 
@@ -219,6 +230,19 @@ $(MODULE_NAME)-objs += platform/mt6895/mt6895_pos.o
 $(MODULE_NAME)-objs += platform/mt6895/mt6895_pos_gen.o
 $(MODULE_NAME)-objs += platform/mt6895/mt6895_coredump.o
 $(MODULE_NAME)-objs += platform/mt6895/mt6895_debug_gen.o
+endif
+endif
+
+ifeq ($(CONFIG_MTK_COMBO_CHIP_CONSYS_6897),y)
+ifneq ($(wildcard $(PATH_TO_CONNINFRA_DRV)/platform/mt6897),)
+$(MODULE_NAME)-objs += platform/mt6897/mt6897.o
+$(MODULE_NAME)-objs += platform/mt6897/mt6897_pmic.o
+$(MODULE_NAME)-objs += platform/mt6897/mt6897_emi.o
+$(MODULE_NAME)-objs += platform/mt6897/mt6897_consys_reg.o
+$(MODULE_NAME)-objs += platform/mt6897/mt6897_pos.o
+$(MODULE_NAME)-objs += platform/mt6897/mt6897_pos_gen.o
+$(MODULE_NAME)-objs += platform/mt6897/mt6897_coredump.o
+$(MODULE_NAME)-objs += platform/mt6897/mt6897_debug_gen.o
 endif
 endif
 
