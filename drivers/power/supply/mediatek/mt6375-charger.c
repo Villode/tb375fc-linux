@@ -2917,18 +2917,19 @@ static int mt6375_chg_init_irq(struct mt6375_chg_data *ddata)
 		ret = platform_get_irq_byname(to_platform_device(ddata->dev),
 					      mt6375_chg_irqs[i].name);
 		if (ret < 0) {
-			dev_err(ddata->dev, "failed to get irq %s\n",
-				mt6375_chg_irqs[i].name);
-			return ret;
+			/* TOUCH/CHG-NOIRQ-2026-09-17: no EINT controller; VBUS work polls */
+			dev_info(ddata->dev, "no irq %s; polled only\n",
+				 mt6375_chg_irqs[i].name);
+			continue;
 		}
 		ret = devm_request_threaded_irq(ddata->dev, ret, NULL,
 						mt6375_chg_irqs[i].hdlr,
 						IRQF_ONESHOT,
 						dev_name(ddata->dev), ddata);
 		if (ret < 0) {
-			dev_err(ddata->dev, "failed to request irq %s\n",
-				mt6375_chg_irqs[i].name);
-			return ret;
+			dev_warn(ddata->dev, "failed to request irq %s; continue\n",
+				 mt6375_chg_irqs[i].name);
+			continue;
 		}
 	}
 	return 0;
@@ -2993,6 +2994,45 @@ static ssize_t shipping_mode_store(struct device *dev,
 	ret = mt6375_set_shipping_mode(ddata);
 	return ret < 0 ? ret : count;
 }
+/*
+ * charging_enabled —— 可读回的充电开关。
+ * 只写 F_CHG_EN；**不写 F_BUCK_EN**（BUCK 是 VBUS->VSYS 供电路径，
+ * 本机只有 USB 一条访问通道，清掉它可能连系统供电一起断）。
+ * 见 tools/patches/add_chg_charging_enabled.py 的文件头说明。
+ */
+static ssize_t charging_enabled_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	struct mt6375_chg_data *ddata = dev_get_drvdata(dev);
+	bool en = false;
+	int ret = mt6375_chg_is_enabled(ddata, &en);
+
+	if (ret < 0)
+		return ret;
+
+	return sysfs_emit(buf, "%d\n", en);
+}
+
+static ssize_t charging_enabled_store(struct device *dev,
+				      struct device_attribute *attr,
+				      const char *buf, size_t count)
+{
+	struct mt6375_chg_data *ddata = dev_get_drvdata(dev);
+	unsigned long v;
+	int ret;
+
+	ret = kstrtoul(buf, 0, &v);
+	if (ret < 0)
+		return ret;
+
+	ret = mt6375_chg_field_set(ddata, F_CHG_EN, v ? 1 : 0);
+	if (!ret && ddata->psy)
+		power_supply_changed(ddata->psy);
+
+	return ret < 0 ? ret : count;
+}
+static DEVICE_ATTR_RW(charging_enabled);
+
 static const DEVICE_ATTR_WO(shipping_mode);
 
 static int mt6375_chg_probe(struct platform_device *pdev)
@@ -3059,6 +3099,10 @@ static int mt6375_chg_probe(struct platform_device *pdev)
 		dev_err(dev, "failed to create shipping mode attribute\n");
 		goto out_wq;
 	}
+
+	ret = device_create_file(dev, &dev_attr_charging_enabled);
+	if (ret < 0)
+		dev_warn(dev, "failed to create charging_enabled attribute\n");
 
 	ret = mt6375_chg_init_setting(ddata);
 	if (ret < 0) {
