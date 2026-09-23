@@ -121,3 +121,34 @@ config MTK_SOCINFO
 	  manufacturer name, marketing name and soc name.
 
 endmenu
+
+config MTK_SCPSYS_MT6897_GPUSYS
+	bool "MediaTek MT6897 gpusys (gpu_eb_rpc) MFG power domains"
+	depends on ARCH_MEDIATEK
+	depends on PM
+	select PM_GENERIC_DOMAINS
+	select REGMAP
+	select MTK_INFRACFG
+	default y
+	help
+	  Reverse-engineered MFG1..MFG14 power domains under the MT6897
+	  "mediatek,mt6897-gpusys" controller (base 0x13f91000). Required so a
+	  consumer (e.g. panthor) can power the Mali GPU block.
+
+config MTK_SCPSYS_MT6897
+	bool "MediaTek MT6897 SPM power domains"
+	depends on ARCH_MEDIATEK
+	depends on PM
+	default y
+	select PM_GENERIC_DOMAINS
+	select MTK_INFRACFG
+	help
+	  MT6897 SPM (power-controller@1c001000, "mediatek,mt6897-scpsys")
+	  power domains, reverse-engineered from the vendor
+	  mtk-scpsys-mt6897.ko.  Currently only the "conn" domain
+	  (WiFi/BT/GNSS connsys MTCMOS) is modelled -- it is the only one
+	  with a mainline consumer.  Data for all 33 domains lives in
+	  ref/mt6897-scpsys-domains.json.
+
+	  Also builds mtk-scpsys.o (the core), which exports
+	  init_scp()/mtk_register_power_domains().

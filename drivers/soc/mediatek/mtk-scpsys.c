@@ -609,11 +609,18 @@ static int scpsys_power_on(struct generic_pm_domain *genpd)
 			goto err_sram;
 	}
 
+	pr_err("SCPSYS-STEP %s: pre-sram ctl=0x%x pdn=0x%x ack=0x%x caps=0x%x\n",
+	       genpd->name, readl(ctl_addr), scpd->data->sram_pdn_bits,
+	       scpd->data->sram_pdn_ack_bits, scpd->data->caps);
 	ret = scpsys_sram_enable(scpd, ctl_addr);
+	pr_err("SCPSYS-STEP %s: post-sram ret=%d ctl=0x%x\n",
+	       genpd->name, ret, readl(ctl_addr));
 	if (ret < 0)
 		goto err_sram;
 
 	ret = scpsys_bus_protect_disable(scpd, MAX_STEPS - 1);
+	pr_err("SCPSYS-STEP %s: post-bus ret=%d ctl=0x%x\n",
+	       genpd->name, ret, readl(ctl_addr));
 	if (ret < 0)
 		goto err_sram;
 
@@ -1140,6 +1147,7 @@ struct scp *init_scp(struct platform_device *pdev,
 	if (!scp)
 		return ERR_PTR(-ENOMEM);
 
+	pr_emerg("SCPSYS-DIAG: init_scp enter\n");
 	scp->ctrl_reg.pwr_sta_offs = scp_ctrl_reg->pwr_sta_offs;
 	scp->ctrl_reg.pwr_sta2nd_offs = scp_ctrl_reg->pwr_sta2nd_offs;
 
@@ -1150,6 +1158,7 @@ struct scp *init_scp(struct platform_device *pdev,
 	if (IS_ERR(scp->base))
 		return ERR_CAST(scp->base);
 
+	pr_emerg("SCPSYS-DIAG: before domains kcalloc\n");
 	scp->domains = devm_kcalloc(&pdev->dev,
 				num, sizeof(*scp->domains), GFP_KERNEL);
 	if (!scp->domains)
@@ -1162,6 +1171,7 @@ struct scp *init_scp(struct platform_device *pdev,
 	if (!pd_data->domains)
 		return ERR_PTR(-ENOMEM);
 
+	pr_emerg("SCPSYS-DIAG: before infracfg lookup\n");
 	scp->infracfg = syscon_regmap_lookup_by_phandle(pdev->dev.of_node,
 			"infracfg");
 	if (IS_ERR(scp->infracfg)) {
@@ -1231,6 +1241,7 @@ struct scp *init_scp(struct platform_device *pdev,
 		return ERR_CAST(scp->hwv_regmap);
 	}
 
+	pr_emerg("SCPSYS-DIAG: before regulator loop\n");
 	for (i = 0; i < num; i++) {
 		struct scp_domain *scpd = &scp->domains[i];
 		const struct scp_domain_data *data = &scp_domain_data[i];
@@ -1256,6 +1267,7 @@ struct scp *init_scp(struct platform_device *pdev,
 
 		scpd->data = data;
 
+		pr_emerg("SCPSYS-DIAG: domain %d clk setup\n", i);
 		ret = init_basic_clks(pdev, scpd->clk, data->basic_clk_name);
 		if (ret)
 			return ERR_PTR(ret);
@@ -1314,6 +1326,7 @@ struct scp *init_scp(struct platform_device *pdev,
 		}
 	}
 
+	pr_emerg("SCPSYS-DIAG: init_scp return\n");
 	return scp;
 }
 EXPORT_SYMBOL(init_scp);

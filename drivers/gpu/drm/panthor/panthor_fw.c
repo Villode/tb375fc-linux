@@ -1129,7 +1129,9 @@ static int panthor_fw_start(struct panthor_device *ptdev)
 	panthor_job_irq_resume(&ptdev->fw->irq);
 
 #if IS_ENABLED(CONFIG_MTK_GPUEB)
-	if (of_machine_is_compatible("mediatek,mt6895") &&
+	/* MT6897-GPUEB-2026-09-17 */
+	    if ((of_machine_is_compatible("mediatek,mt6895") ||
+		 of_machine_is_compatible("mediatek,mt6897")) &&
 	    mt6895_gpueb_available()) {
 		ret = mt6895_gpueb_power_on();
 		if (ret) {

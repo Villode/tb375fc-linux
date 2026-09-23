@@ -257,7 +257,9 @@ int panthor_device_init(struct panthor_device *ptdev)
 	/* MT6895: gpueb owns GPU power. Ask it to power on before touching any
 	 * GPU registers, otherwise panthor reads all-zero ID/features.
 	 */
-	if (of_machine_is_compatible("mediatek,mt6895") &&
+	/* MT6897-GPUEB-2026-09-17 */
+	    if ((of_machine_is_compatible("mediatek,mt6895") ||
+		 of_machine_is_compatible("mediatek,mt6897")) &&
 	    mt6895_gpueb_available()) {
 		ret = mt6895_gpueb_power_on();
 		if (ret) {
