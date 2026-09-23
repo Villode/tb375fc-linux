@@ -1,7 +1,7 @@
 # Mainline Linux for Lenovo Xiaoxin Pad Pro 12.7 (TB375FC / MT6897)
 
-基于 [MT6895-Mainline/linux](https://github.com/MT6895-Mainline/linux)（Linux 7.2）的
-联想小新 Pad Pro 12.7（TB375FC，MT6897 / Dimensity 8300）主线内核移植。
+基于 Linux 7.2 主线内核的
+联想小新 Pad Pro 12.7（TB375FC，MT6897 / Dimensity 8300）移植。
 
 > ⚠️ WIP。仅供学习研究，刷写有风险。
 
