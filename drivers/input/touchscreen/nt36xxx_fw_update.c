@@ -47,6 +47,60 @@ MODULE_PARM_DESC(fwu_verify, "Read back every SRAM write while flashing (debug o
 /* 2026-09-14 A/B knob: skip the cascade tx-auto-copy handshake */
 static bool nvt_no_autocopy;
 module_param_named(no_autocopy, nvt_no_autocopy, bool, 0644);
+
+/* TOUCH-DLM-AB-2026-09-17: online A/B knobs for the DLM hw-CRC failure */
+static bool nvt_skip_dlm;
+module_param_named(skip_dlm, nvt_skip_dlm, bool, 0644);
+static uint32_t nvt_dlm_len_ovr;
+module_param_named(dlm_len, nvt_dlm_len_ovr, uint, 0644);
+/* TOUCH-DMA-CRC-2026-09-17 A/B override for the vendor DMA-CRC step that the mainline
+ * NT36532_memory_map gates off (its .DMA_CRC_EN_ADDR is 0).
+ * dma_crc_en : address of the DMA CRC enable register (0 = use mmap, i.e. skip)
+ * dma_crc_tgt: address whose first 32 bytes get cleared (0 = bin_map[1].SRAM_addr)
+ */
+static uint32_t nvt_dma_crc_en_ovr;
+module_param_named(dma_crc_en, nvt_dma_crc_en_ovr, uint, 0644);
+MODULE_PARM_DESC(dma_crc_en, "address of the vendor DMA CRC enable register (0=skip)");
+static uint32_t nvt_dma_crc_tgt_ovr;
+module_param_named(dma_crc_tgt, nvt_dma_crc_tgt_ovr, uint, 0644);
+MODULE_PARM_DESC(dma_crc_tgt, "address to clear 32 bytes at before DMA CRC (0=DLM SRAM addr)");
+
+/* TOUCH-DLM-RETRY-GATE-2026-09-17: gate for the one-shot "G_DLM := R_DLM" experiment.
+ * That experiment mutates bin_map[1].crc, which pollutes every later golden-DLM
+ * log line and can make the firmware's DLM CRC look corrupt when it is not.
+ * Its conclusion is already known (rewriting golden still fails), so OFF by default. */
+static bool nvt_dlm_retry_en;
+module_param_named(dlm_retry, nvt_dlm_retry_en, bool, 0644);
+MODULE_PARM_DESC(dlm_retry, "run the one-shot G_DLM:=R_DLM experiment on first failure (poisons bin_map[1].crc)");
+
+/* TOUCH-DLM-GOLDEN-OVR-2026-09-17: force the DLM golden CRC written into the IC.
+ * The firmware header at 0x1C holds 0xF7B80CC0, but the driver's retry path can
+ * leave a stale value behind. 0 = use bin_map[1].crc unmodified. */
+static uint32_t nvt_dlm_golden_ovr;
+module_param_named(dlm_golden, nvt_dlm_golden_ovr, uint, 0644);
+MODULE_PARM_DESC(dlm_golden, "force DLM golden CRC written to the IC (0=use firmware header value)");
+
+/*
+ * TOUCH-SKIP-BOOT-FW-2026-09-19: skip the boot-time firmware flash entirely
+ * and let the IC run the firmware built into its own flash.  The DLM download
+ * currently fails (ILM CRC ok, DLM CRC mismatch) and the partial update leaves
+ * the IC's RAM firmware inconsistent for that boot.  The IC's built-in
+ * firmware is what the stock vendor kernel runs.
+ */
+static bool nvt_skip_boot_fw;
+module_param_named(skip_boot_fw, nvt_skip_boot_fw, bool, 0644);
+MODULE_PARM_DESC(skip_boot_fw, "skip boot fw update, run the IC's built-in firmware");
+
+
+static bool nvt_autocopy_dma;
+module_param_named(autocopy_dma, nvt_autocopy_dma, bool, 0644);
+
+/* autocopy_dma selects the vendor CHECK_SPI_DMA_TX_INFO register */
+static uint32_t nvt_autocopy_req_addr(void)
+{
+	return nvt_autocopy_dma ? ts->mmap->CP_TP_CPU_REQ2
+				: ts->mmap->CP_TP_CPU_REQ;
+}
 MODULE_PARM_DESC(no_autocopy, "skip tx_auto_copy_mode/wait_auto_copy in hw_crc download");
 
 #define SIZE_4KB 4096
@@ -164,6 +218,7 @@ return:
 *******************************************************/
 static uint32_t partition = 0;
 static uint8_t ilm_dlm_num = 2;
+static uint8_t cascade_2nd_header_info = 0;
 static int32_t nvt_bin_header_parser(const u8 *fwdata, size_t fwsize)
 {
 	uint32_t list = 0;
@@ -175,14 +230,25 @@ static int32_t nvt_bin_header_parser(const u8 *fwdata, size_t fwsize)
 
 	/* Find the header size */
 	end = fwdata[0] + (fwdata[1] << 8) + (fwdata[2] << 16) + (fwdata[3] << 24);
-	if (fwdata[0x20] & 0x02) {
-		NVT_LOG("Cascade 2nd header detected (0x%02X), adjusting header size from 0x%X to 0x%X\n", fwdata[0x20], end, end / 2);
-		end = end / 2;
-	}
-	pos = 0x30;	/* info section start at 0x30 offset */
-	while (pos < end) {
-		info_sec_num ++;
-		pos += 0x10; /* each header info is 16 bytes */
+	/* vendor nt36532.dis 65a4-65e4 + OrangeFox ground truth 2026-09-16:
+	 * cascade -> count over pos < end/2, then +1 for the cascade 2nd
+	 * header itself (info_sec_num=14, partition=16; matches vendor log) */
+	cascade_2nd_header_info = (fwdata[0x20] & 0x02) >> 1;
+	NVT_LOG("cascade_2nd_header_info = %d\n", cascade_2nd_header_info);
+	if (cascade_2nd_header_info) {
+		pos = 0x30;
+		while (pos < (end / 2)) {
+			info_sec_num++;
+			pos += 0x10;
+		}
+		info_sec_num = info_sec_num + 1;
+		NVT_LOG("Cascade header: end=0x%X -> info_sec_num=%d\n", end, info_sec_num);
+	} else {
+		pos = 0x30;	/* info section start at 0x30 offset */
+		while (pos < end) {
+			info_sec_num ++;
+			pos += 0x10; /* each header info is 16 bytes */
+		}
 	}
 
 	/*
@@ -577,28 +643,23 @@ static int32_t nvt_write_sram(const u8 *fwdata,
 		 * 这里把每笔传输裁到当前页内。
 		 */
 		{
-			uint32_t done = 0;
-
-			while (done < len) {
-				uint32_t space = 0x80 - ((SRAM_addr + done) & 0x7F);
-				uint32_t piece = len - done;
-
-				if (piece > space)
-					piece = space;
-
-				ret = nvt_set_page(SRAM_addr + done);
-				if (ret) {
-					NVT_ERR("set page failed, ret = %d\n", ret);
-					return ret;
-				}
-				fwbuf[0] = (SRAM_addr + done) & 0x7F;
-				memcpy(fwbuf + 1, &fwdata[BIN_addr + done], piece);
-				ret = CTP_SPI_WRITE(ts->client, fwbuf, piece + 1);
-				if (ret) {
-					NVT_ERR("write to sram failed, ret = %d\n", ret);
-					return ret;
-				}
-				done += piece;
+			/* E5c: vendor-equivalent single-shot write.
+			 * Vendor nt36532.dis 0x72b8-0x72f8 does one set_page then one
+			 * CTP_SPI_WRITE(fwbuf, len+1) per 0xFC00 chunk (crossing pages
+			 * freely).  We used to split at 0x80 boundaries; data landed
+			 * identically (readback 0 diff) but the SPI transaction
+			 * structure differed from the vendor.  This matches vendor. */
+			ret = nvt_set_page(SRAM_addr);
+			if (ret) {
+				NVT_ERR("set page failed, ret = %d\n", ret);
+				return ret;
+			}
+			fwbuf[0] = SRAM_addr & 0x7F;
+			memcpy(fwbuf + 1, &fwdata[BIN_addr], len);
+			ret = CTP_SPI_WRITE(ts->client, fwbuf, len + 1);
+			if (ret) {
+				NVT_ERR("write to sram failed, ret = %d\n", ret);
+				return ret;
 			}
 		}
 		/*
@@ -759,14 +820,55 @@ This function will set hw crc reg before enable crc function.
 return:
 	n.a.
 *******************************************************/
+/* TOUCH-DMA-CRC-2026-09-17
+ * Vendor nt36532.ko, nvt_update_firmware() @0x6e18..0x6eb8, gated on
+ * mmap->DMA_CRC_EN_ADDR != 0:
+ *   1) set_page(bin_map[1].SRAM_addr); write 33 bytes  = [addr&0x7f] + 32 * 0x00
+ *   2) set_page(DMA_CRC_EN_ADDR);      write  5 bytes  = [addr&0x7f] 35 32 AA 00
+ */
+static void nvt_dma_crc_setup(void)
+{
+	uint32_t en = nvt_dma_crc_en_ovr;
+	uint32_t tgt = nvt_dma_crc_tgt_ovr;
+	uint8_t buf[33];
+
+	if (!en)
+		en = ts->mmap->DMA_CRC_EN_ADDR;
+	if (!en)
+		return;
+
+	if (!tgt)
+		tgt = bin_map[1].SRAM_addr;
+
+	if (tgt) {
+		memset(buf, 0, sizeof(buf));
+		buf[0] = tgt & 0x7F;
+		nvt_set_page(tgt);
+		CTP_SPI_WRITE(ts->client, buf, 33);
+	}
+
+	buf[0] = en & 0x7F;
+	buf[1] = 0x35;
+	buf[2] = 0x32;
+	buf[3] = 0xAA;
+	buf[4] = 0x00;
+	nvt_set_page(en);
+	CTP_SPI_WRITE(ts->client, buf, 5);
+
+	NVT_ERR("[dma_crc] en=0x%X (clear 32B at 0x%X)\n", en, tgt);
+}
+
 static void nvt_tx_auto_copy_mode(void)
 {
 	if (ts->carrier_system == 1) {
 		nvt_write_addr(ts->mmap->CP_TP_CPU_REQ, 0x69);
 	} else if (ts->carrier_system == 2) {
-		nvt_write_addr(ts->mmap->CP_TP_CPU_REQ, 0x56);
+		/* TOUCH-DLM-AB-2026-09-17: vendor CHECK_SPI_DMA_TX_INFO writes 0x69 */
+		nvt_write_addr(ts->mmap->CP_TP_CPU_REQ,
+				nvt_autocopy_dma ? 0x69 : 0x56);
 	}
-	NVT_LOG("tx auto copy mode %d enable\n", ts->carrier_system);
+	if (nvt_dump_bld_bank_en)
+		NVT_LOG("tx auto copy mode %d enable\n", ts->carrier_system);
 }
 
 static int32_t nvt_check_tx_auto_copy(void)
@@ -774,20 +876,22 @@ static int32_t nvt_check_tx_auto_copy(void)
 	int32_t i = 0;
 	uint8_t buf[4] = {0};
 	int32_t retry = 200;
+	uint32_t req = nvt_autocopy_req_addr(); /* TOUCH-DLM-AB-2026-09-17 */
 
-	if (ts->mmap->CP_TP_CPU_REQ == 0) {
+	if (req == 0) {
 		NVT_ERR("error, TX_AUTO_COPY_EN = 0\n");
 		return -1;
 	}
 
 	for (i = 0; i < retry; i++) {
-		nvt_set_page(ts->mmap->CP_TP_CPU_REQ);
-		buf[0] = ts->mmap->CP_TP_CPU_REQ & 0x7F;
+		nvt_set_page(req);
+		buf[0] = req & 0x7F;
 		buf[1] = 0xFF;
 		CTP_SPI_READ(ts->client, buf, 2);
 
 		if (buf[1] == 0x00) {
-			NVT_LOG("tx auto copy done (i=%d)!\n", i);
+			if (nvt_dump_bld_bank_en)
+				NVT_LOG("tx auto copy done (i=%d)!\n", i);
 			return 0;
 		}
 
@@ -827,7 +931,10 @@ static void nvt_set_bld_crc_bank(uint32_t DES_ADDR, uint32_t SRAM_ADDR,
 	CTP_SPI_WRITE(ts->client, fwbuf, 4);
 
 	/* write length */
-	nvt_set_page(LENGTH_ADDR);
+	/* TOUCH-SETPAGE-ALIGN-2026-09-17: vendor nt36532.ko issues set_page ONCE (before DES) and then
+	 * writes length/checksum back-to-back; extra set_page breaks the
+	 * IC-side transaction sequence. */
+	/* nvt_set_page(LENGTH_ADDR); */
 	fwbuf[0] = LENGTH_ADDR & 0x7F;
 	fwbuf[1] = (size) & 0xFF;
 	fwbuf[2] = (size >> 8) & 0xFF;
@@ -839,7 +946,8 @@ static void nvt_set_bld_crc_bank(uint32_t DES_ADDR, uint32_t SRAM_ADDR,
 	}
 
 	/* write golden checksum */
-	nvt_set_page(G_CHECKSUM_ADDR);
+	/* TOUCH-SETPAGE-ALIGN-2026-09-17: see above -- vendor has no set_page here either */
+	/* nvt_set_page(G_CHECKSUM_ADDR); */
 	fwbuf[0] = G_CHECKSUM_ADDR & 0x7F;
 	fwbuf[1] = (crc) & 0xFF;
 	fwbuf[2] = (crc >> 8) & 0xFF;
@@ -860,6 +968,24 @@ return:
 *******************************************************/
 static void nvt_set_bld_hw_crc(void)
 {
+	/* TOUCH-DLM-AB-2026-09-17: A/B overrides applied before the bank is written */
+	if (nvt_skip_dlm) {
+		bin_map[1].size = 0;
+		bin_map[1].crc = 0;
+		NVT_ERR("[skip_dlm] DLM suppressed (size=0, crc=0)\n");
+	} else if (nvt_dlm_len_ovr) {
+		bin_map[1].size = nvt_dlm_len_ovr;
+		NVT_ERR("[dlm_len] DLM size overridden to 0x%X\n",
+			nvt_dlm_len_ovr);
+	}
+
+	/* TOUCH-DLM-GOLDEN-OVR-2026-09-17: optional forced golden CRC */
+	if (nvt_dlm_golden_ovr) {
+		NVT_ERR("[dlm_golden] DLM golden CRC 0x%08X -> 0x%08X (forced)\n",
+			bin_map[1].crc, nvt_dlm_golden_ovr);
+		bin_map[1].crc = nvt_dlm_golden_ovr;
+	}
+
 	/* [0] ILM */
 	/* write register bank */
 	nvt_set_bld_crc_bank(ts->mmap->ILM_DES_ADDR, bin_map[0].SRAM_addr,
@@ -952,6 +1078,11 @@ void nvt_dump_bld_bank(const char *tag)
 	uint32_t bld_des, ilm_des, dlm_des, ilm_len, dlm_len, bld_len;
 	int32_t ret;
 	int i;
+
+	/* 默认关闭：每次 11 行、单次下载调 6 次、失败再重试 20 轮，
+	 * 开着会把日志刷掉几千行。用 nt36xxx_ts.dump_bld_bank=1 打开。 */
+	if (!nvt_dump_bld_bank_en)
+		return;
 
 	nvt_set_page(BLD_BANK_ADDR);
 	buf[0] = (uint8_t)(BLD_BANK_ADDR & 0x7F);
@@ -1215,6 +1346,10 @@ static void nvt_dump_event_buf(const char *tag)
 	uint8_t buf[0x81];
 	int i;
 
+	/* 与 nvt_dump_bld_bank 同一个开关：默认关闭，避免刷屏 */
+	if (!nvt_dump_bld_bank_en)
+		return;
+
 	memset(buf, 0, sizeof(buf));
 	nvt_set_page(ts->mmap->EVENT_BUF_ADDR);
 	buf[0] = ts->mmap->EVENT_BUF_ADDR & 0x7F;
@@ -1322,11 +1457,22 @@ static int32_t nvt_download_firmware_hw_crc(void)
 		nvt_bootloader_reset();
 		nvt_dump_bld_bank("1-after-bootloader-reset");
 
+		/* TOUCH-DLM-GOLDEN-OVR-2026-09-17: log the pristine firmware values
+		 * BEFORE any bank write or retry path can mutate them. This is the
+		 * ground truth for what the firmware header actually contains. */
+		NVT_ERR("[bld-bin] firmware header: ILM BIN=0x%08X SRAM=0x%08X size=0x%X crc=0x%08X | "
+			"DLM BIN=0x%08X SRAM=0x%08X size=0x%X crc=0x%08X\n",
+			bin_map[0].BIN_addr, bin_map[0].SRAM_addr, bin_map[0].size, bin_map[0].crc,
+			bin_map[1].BIN_addr, bin_map[1].SRAM_addr, bin_map[1].size, bin_map[1].crc);
+
 		/* set ilm & dlm reg bank (MUST precede write_firmware as in vendor nt36532.ko) */
 		nvt_set_bld_hw_crc();
 		nvt_dump_bld_bank("2-after-set-bld-hw-crc");
 
-		/* cascade tx auto copy mode */
+		/* TOUCH-DMA-CRC-2026-09-17 */
+	nvt_dma_crc_setup();
+
+	/* cascade tx auto copy mode */
 		if (nvt_no_autocopy)
 			NVT_ERR("[noautocopy] skipping tx_auto_copy_mode\n");
 		else
@@ -1365,8 +1511,13 @@ static int32_t nvt_download_firmware_hw_crc(void)
 		ret = nvt_check_fw_reset_state(RESET_STATE_INIT);
 		if (ret) {
 			NVT_ERR("nvt_check_fw_reset_state failed. (%d)\n", ret);
-			/* ★ 决定性实验：只在第一轮做一次，之后按原逻辑重试 */
-			if (retry == 0) {
+			/* ★ 决定性实验：只在第一轮做一次，之后按原逻辑重试
+			 * TOUCH-DLM-RETRY-GATE-2026-09-17: 默认关闭。该实验会改写
+			 * bin_map[1].crc，污染后续所有 golden DLM 读数，让排查者误判
+			 * 固件里的 DLM CRC 是错的。结论已得出（改 golden 仍失败 ⇒
+			 * DLM golden 不是启动门），故默认不再执行。需要重跑实验时
+			 * 写 dlm_retry=1 打开。 */
+			if (retry == 0 && nvt_dlm_retry_en) {
 				nvt_dlm_golden_retry();
 				ret = nvt_check_fw_reset_state(RESET_STATE_INIT);
 				NVT_ERR("[dlm-retry] post-experiment reset_state check = %d\n", ret);
@@ -1498,6 +1649,14 @@ int32_t nvt_update_firmware(const char *firmware_name)
 {
 	int32_t ret = 0;
 
+	/* TOUCH-BASELINE-2026-09-17: 保全模式 —— 一次写都不下发，IC 保持 LK 交出来的状态。
+	 * 用于判决「IC 自己能不能跑」与「是不是我们把它打死的」。 */
+	if (nvt_tddi_preserve) {
+		NVT_LOG("TDDI preservation: skipping firmware download (%s)\n",
+			firmware_name);
+		return 0;
+	}
+
 	/*
 	 * 唯一的擦写入口：所有路径（boot 更新 / ESD-WDT 恢复 / proc sysfs）都过这里，
 	 * 所以闸门放在这个点上最稳。没有校验过芯片身份就不允许触碰 flash。
@@ -1523,7 +1682,7 @@ int32_t nvt_update_firmware(const char *firmware_name)
 		goto download_fail;
 	}
 
-	if (bin_map) {
+	if (bin_map && nvt_dump_bld_bank_en) {
 		int _i;
 		for (_i = 0; _i < 2; _i++)
 			NVT_ERR("[bld:0-bin-map] [%d]%s BIN=0x%06X SRAM=0x%06X size=0x%06X crc=0x%08X\n",
@@ -1531,8 +1690,10 @@ int32_t nvt_update_firmware(const char *firmware_name)
 				bin_map[_i].size, bin_map[_i].crc);
 	}
 
-	/* 2026-09-14: prove the runtime map equals the vendor table */
-	{
+	/* 2026-09-14: prove the runtime map equals the vendor table.
+	 * 默认关闭 —— 这张表 59 个 uint32，nvt_update_firmware() 每次调用都打，
+	 * 一次开机光这里就 700 行。用 nt36xxx_ts.dump_bld_bank=1 打开。 */
+	if (nvt_dump_bld_bank_en) {
 		const uint32_t *mp = (const uint32_t *)ts->mmap;
 		int _k;
 		for (_k = 0; _k < (int)(sizeof(*ts->mmap) / sizeof(uint32_t)); _k++)
@@ -1587,7 +1748,7 @@ void Boot_Update_Firmware(struct work_struct *work)
 	 *   擦写 flash。否则 SPI 读回恒为 0 时也会照走完整流程 —— 包括 erase ——
 	 *   把固件刷给一颗身份不明的芯片；写错的东西掉电后不会自愈。
 	 */
-	if (!ts->fw_update_allowed) {
+	if (!ts->fw_update_allowed || nvt_skip_boot_fw) {
 		NVT_ERR("chip identity NOT verified -> skipping firmware flash "
 			"(running on the IC's built-in firmware)\n");
 		NVT_ERR("  set nt36xxx_ts.force_fw_update=1 only after the chip answers correctly\n");
@@ -1622,10 +1783,17 @@ void Boot_Update_Firmware(struct work_struct *work)
 		nvt_check_fw_reset_state(RESET_STATE_NORMAL_RUN);
 	} else {
 		static int fwu_retry_cnt;
-		if (fwu_retry_cnt < 20) {
+		if (fwu_retry_cnt < (int)nvt_fw_retry_max) {
 			fwu_retry_cnt++;
-			NVT_LOG("Touch FW update failed (%d), will retry in 3s (attempt %d/20)...\n", ret, fwu_retry_cnt);
+			NVT_LOG("Touch FW update failed (%d), will retry in 3s (attempt %d/%u)...\n",
+				ret, fwu_retry_cnt, nvt_fw_retry_max);
 			queue_delayed_work(nvt_fwu_wq, &ts->nvt_fwu_work, msecs_to_jiffies(3000));
+		} else if (fwu_retry_cnt == (int)nvt_fw_retry_max) {
+			fwu_retry_cnt++;
+			NVT_ERR("FW update gave up after %u attempts; asking IC to enter NORMAL_RUN anyway\n",
+				nvt_fw_retry_max);
+			nvt_change_mode(0);
+			nvt_check_fw_reset_state(RESET_STATE_NORMAL_RUN);
 		}
 	}
 	nvt_get_fw_info();

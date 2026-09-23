@@ -63,6 +63,7 @@ static struct workqueue_struct *nvt_esd_check_wq;
 static unsigned long irq_timer = 0;
 uint8_t esd_check = false;
 uint8_t esd_retry = 0;
+static bool esd_warned = false;   /* 同一轮 ESD 事件只报一次，避免每 1500 ms 刷屏 */
 #endif /* #if NVT_TOUCH_ESD_PROTECT */
 
 static char saved_cmdline[MAX_CMDLINE_PARAM_LEN] = {'\0'};
@@ -133,6 +134,71 @@ static bool nvt_force_fw_update;
 module_param_named(force_fw_update, nvt_force_fw_update, bool, 0644);
 MODULE_PARM_DESC(force_fw_update,
 	"Allow firmware flashing even though the chip ID could not be verified (DANGEROUS)");
+
+/*
+ * 2026-09-15: vendor `nvt_ts_probe` parity.  The vendor driver issues
+ * nvt_eng_reset() (0x5A -> ENG_RST_ADDR) in probe, before chip verification
+ * and before any firmware work (0x286c in nvt_ts_probe).  This port never did,
+ * which leaves the IC in a state where it accepts and CRC-verifies a host image
+ * but never executes it.  Off-switch for A/B testing.
+ */
+/* TOUCH-READONLY-PROBE-2026-09-17: 1 = 开机对 IC 一次写都不发（跳过芯片识别里的 bootloader_reset 与
+ * probe 前导的 eng_reset）。配合 tddi_preserve=1，看到的就是 IC 自己的状态。
+ *
+ * 之前所有「保全态」实验都不是真保全：nvt_ts_check_chip_ver_trim() 的 5 次重试
+ * 循环第一句就是 nvt_bootloader_reset()，IC 在 probe 阶段已经被踢进 bootloader。
+ */
+static bool nvt_probe_readonly;
+module_param_named(probe_readonly, nvt_probe_readonly, bool, 0644);
+MODULE_PARM_DESC(probe_readonly,
+	"1 = never write to the IC at probe (skip GPIO/reset/eng_reset/bootloader_reset); 0 = normal");
+static bool nvt_probe_eng_reset = true;
+module_param_named(probe_eng_reset, nvt_probe_eng_reset, bool, 0644);
+MODULE_PARM_DESC(probe_eng_reset,
+	"issue nvt_eng_reset() + release the TP reset in probe, as the vendor nt36532.ko does");
+
+/*
+ * dump_bld_bank: 默认 **0（关闭）** —— 移植期的详细诊断总开关。
+ *
+ * 它控制三处寄存器/表转储（都是 2026-09-14 追 hw_crc 下载流程时加的）：
+ *   nvt_dump_bld_bank()   BLD-CRC 寄存器组（0x1FB500 + peer 0x1FC900），每次 11 行
+ *   nvt_dump_event_buf()  EVENT_BUF 0x00..0x7F
+ *   nvt_update_firmware() 里那张 mmap 表（59 个 uint32）
+ *
+ * 为什么默认关：一次固件下载流程里 nvt_dump_bld_bank() 被调用 6 次，
+ * nvt_update_firmware() 被调用十几次，失败后 Boot_Update_Firmware 还要重试 20 轮，
+ * ESD 恢复路径也会再来 —— 实测每次开机几千行寄存器转储，把串口和 dmesg 全淹掉，
+ * 出别的问题时根本看不出上下文（修之前 dmesg 里 97% 是触摸日志）。
+ *
+ * 需要重新追 hw_crc 下载流程时再打开：
+ *     nt36xxx_ts.dump_bld_bank=1
+ * 或运行时：
+ *     echo 1 > /sys/module/nt36xxx_ts/parameters/dump_bld_bank
+ */
+bool nvt_dump_bld_bank_en;
+/* TOUCH-BASELINE-2026-09-17: 1 = 完全不下载固件（IC 保持 LK 交出来的状态）；0 = 允许下载。
+ * 装在 nvt_update_firmware() 入口，一处覆盖 boot / ESD-WDT / proc / resume 全路径。 */
+bool nvt_tddi_preserve;
+module_param_named(tddi_preserve, nvt_tddi_preserve, bool, 0644);
+MODULE_PARM_DESC(tddi_preserve,
+	"1 = never download firmware (leave the IC as LK handed it over); 0 = allow");
+module_param_named(dump_bld_bank, nvt_dump_bld_bank_en, bool, 0644);
+MODULE_PARM_DESC(dump_bld_bank,
+	"Verbose porting diagnostics: BLD-CRC bank, EVENT_BUF and the mmap table (very verbose)");
+
+/*
+ * fw_retry_max: Boot_Update_Firmware 失败后的重试次数，默认 **3**（原来硬编码 20）。
+ *
+ * 为什么要降：这颗 IC 的固件下载目前稳定失败（reset_state 停在 0x9F），
+ * 重试 20 轮 × 3 秒 = 一分钟，每轮十几行 —— 实测开机一次性刷出约 1300 行，
+ * 直接把早期启动日志挤出 dmesg 环形缓冲（ramoops/USB 初始化的现场就是这么丢的）。
+ * 失败 3 次和失败 20 次结果一样（IC 状态不会自己变好），所以 3 次足够。
+ * 需要长时间反复试探时用 nt36xxx_ts.fw_retry_max=20 恢复原行为。
+ */
+static unsigned int nvt_fw_retry_max = 3;
+module_param_named(fw_retry_max, nvt_fw_retry_max, uint, 0644);
+MODULE_PARM_DESC(fw_retry_max,
+	"Max firmware-update retries at boot (default 3; the original hard-coded value was 20)");
 
 static int32_t nvt_ts_suspend(struct device *dev);
 static int32_t nvt_ts_resume(struct device *dev);
@@ -494,7 +560,8 @@ void nvt_boot_ready(void)
 	/* ---write BOOT_RDY status cmds--- */
 	nvt_write_addr(ts->mmap->BOOT_RDY_ADDR, 1);
 
-	mdelay(5);
+	/* TOUCH-BASELINE-2026-09-17: was mdelay(5). 厂商 nt36532.ko 用 0x147AEB8 ns = 21.475 ms；上游下限 10 ms（注释：old logic 5ms）。 */
+	usleep_range(21000, 22500);
 
 	if (!ts->hw_crc) {
 		/* ---write BOOT_RDY status cmds--- */
@@ -566,14 +633,18 @@ void nvt_bootloader_reset(void)
 {
 	/* ---reset cmds to SWRST_N8_ADDR--- */
 	nvt_write_addr(SWRST_N8_ADDR, 0x69);
-	mdelay(5); /* wait tBRST2FR after Bootload RST */
+	/* TOUCH-BASELINE-2026-09-17: was mdelay(5). 上游：MCU has to reboot from bootloader, this is the typical boot time -> msleep(35)；厂商 21.475 ms。 */
+	msleep(35);
 
 	if (SPI_RD_FAST_ADDR) {
 		/* disable SPI_RD_FAST */
 		nvt_write_addr(SPI_RD_FAST_ADDR, 0x00);
 	}
 
-	NVT_LOG("end\n");
+	/* 纯信息性：一次失败的开机流程里这一步会走 30 多次，
+	 * 归到 dump_bld_bank 开关下，默认不刷。 */
+	if (nvt_dump_bld_bank_en)
+		NVT_LOG("end\n");
 }
 
 /*******************************************************
@@ -750,6 +821,24 @@ int32_t nvt_check_fw_reset_state(RST_COMPLETE_STATE check_reset_state)
 		}
 
 		usleep_range(10000, 10000);
+	}
+
+	/* E6: vendor "firmware ready" beacon (deep-re S2.3, dis 0x10840).
+	 * Read EVENT_BUF+0x50..0x61 once after polling resolves:
+	 * (wbuf[2] & 0xFE) == 0xA0 means the firmware published its ready
+	 * marker.  Read-only, identical SPI page (EVENT_BUF), safe on both
+	 * success and failure paths. */
+	{
+		uint8_t wbuf[20] = {0};
+
+		wbuf[0] = EVENT_MAP_HOST_CMD; /* 0x50 */
+		CTP_SPI_READ(ts->client, wbuf, 18);
+		if (nvt_dump_bld_bank_en)   /* 失败路径每次都要打，归到诊断开关下 */
+			NVT_ERR("beacon(0x50..0x61)=%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X ready=%d ret=%d\n",
+				wbuf[1], wbuf[2], wbuf[3], wbuf[4], wbuf[5], wbuf[6],
+				wbuf[7], wbuf[8], wbuf[9], wbuf[10], wbuf[11], wbuf[12],
+				wbuf[13], wbuf[14], wbuf[15], wbuf[16], wbuf[17], wbuf[18],
+				((wbuf[2] & 0xFE) == 0xA0), ret);
 	}
 
 	/* restore the SPI page to the event buffer (same convention as
@@ -1469,11 +1558,17 @@ EXPORT_SYMBOL_GPL(nvt_touch_reset_and_eng_reset);
 
 static int nvt_gpio_config(struct nvt_ts_data *ts)
 {
-	void __iomem *base = ioremap(0x10005000, 0x1000);
+	void __iomem *base;
 	void __iomem *iocfg_tm;
 	u32 val;
 
+	if (nvt_probe_readonly) {
+		pr_info("[NVT-ts-spi] probe_readonly: skip GPIO/PMIC writes, leave pads as LK left them\n");
+		return 0;
+	}
+
 	nvt_enable_pmic_vtp();
+	base = ioremap(0x10005000, 0x1000);
 
 	if (!base) {
 		pr_err("[NVT-ts-spi] ioremap 0x10005000 failed!\n");
@@ -1567,30 +1662,18 @@ static int nvt_gpio_config(struct nvt_ts_data *ts)
 	writel(val, base + 0x0150);
 
 	/*
-	 * 5. TP_RESET (GPIO 60) —— 必须在本函数返回时**保持复位（LOW）**，
-	 *    由 probe 在 nvt_eng_reset() 之后释放。
-	 *
-	 * 厂商 nt36532.ko 的顺序（nvt_ts_probe 反汇编 0x27f0-0x2888）：
-	 *     nvt_parse_dt()  -> devm_gpiod_get("novatek,reset", GPIOD_OUT_LOW)
-	 *     nvt_gpio_config() 不碰 reset
-	 *     nvt_eng_reset() 写 0x5A 到 ENG_RST(0x7FFF80)，此时 TP_RESX 仍为 LOW
-	 *     gpiod_set_raw_value(reset, 1) 释放复位，msleep(10)
-	 * 驱动自身注释亦写明 “Keep TP_RESX low when send eng reset cmd”。
-	 *
-	 * 之前这里直接输出高电平，于是 nvt_eng_reset() 是在 IC 已脱离复位时发出的
-	 * —— 工程复位不生效，IC 从未进入“主机下载”状态（SPI 可读写、SRAM 写入
-	 * 逐字节正确、BLD CRC 通过，但 MCU 永不启动，reset_state 停在 0x9F）。
+	 * 5. TP_RESET (GPIO 60) —— 返回时保持 LOW，probe 在 eng_reset 之后再释放。
 	 */
 	val = readl(base + 0x0370);
-	val &= ~(0xf << 16);          /* pin 60 -> GPIO mode */
+	val &= ~(0xf << 16);
 	writel(val, base + 0x0370);
 
 	val = readl(base + 0x0010);
-	val |= (1 << 28);             /* DIR = output */
+	val |= (1 << 28);
 	writel(val, base + 0x0010);
 
 	val = readl(base + 0x0110);
-	val &= ~(1 << 28);            /* DOUT = LOW：复位保持，等 probe 释放 */
+	val &= ~(1 << 28);
 	writel(val, base + 0x0110);
 
 	iounmap(base);
@@ -1662,14 +1745,21 @@ static void nvt_esd_check_func(struct work_struct *work)
 			irq_timer = jiffies;
 			/* update esd_retry counter */
 			esd_retry++;
+			esd_warned = false;   /* 新一轮，允许再报一次 */
 		} else {
-			NVT_ERR("esd_retry = %d, g_trigger_disp_esd_recovery true\n", esd_retry);
+			/* 这一支每个 ESD 周期（1500 ms）都会走到，原来会一直刷同一行；
+			 * 改成每个 ESD 事件只报一次，避免刷屏。 */
+			if (!esd_warned) {
+				esd_warned = true;
+				NVT_ERR("esd_retry = %d, g_trigger_disp_esd_recovery true\n", esd_retry);
+			}
  #ifdef CONFIG_MI_DISP_ESD_CHECK 
 			if (g_esd_ctx->panel_init) {
 				atomic_set(&g_esd_ctx->ext_te_event, 1);
 				wake_up_interruptible(&g_esd_ctx->ext_te_wq);
 				nvt_esd_check_enable(false);
 				esd_retry = 0;
+				esd_warned = false;
 			}
 #endif
 		}
@@ -2046,13 +2136,10 @@ static int8_t nvt_ts_check_chip_ver_trim(uint32_t chip_ver_trim_addr)
 	/* ---Check for 5 times--- */
 	for (retry = 5; retry > 0; retry--) {
 
-		nvt_bootloader_reset();
-		/*---set xdata index to chip_ver_trim_addr---*/
+		/* TOUCH-READONLY-PROBE-2026-09-17: 只读探针模式下不复位 —— 否则每次开机都把 IC 踢进 bootloader */
+		if (!nvt_probe_readonly)
+			nvt_bootloader_reset();
 		nvt_set_page(chip_ver_trim_addr);
-
-		buf[0] = chip_ver_trim_addr & 0x7F;
-		memset(buf + 1, 0, 6);
-		CTP_SPI_WRITE(ts->client, buf, 7);
 
 		buf[0] = chip_ver_trim_addr & 0x7F;
 		memset(buf + 1, 0, 6);
@@ -3069,23 +3156,45 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 	mutex_init(&ts->xbuf_lock);
 
 	/*
-	 * ---eng reset 必须在 TP_RESX 仍为低电平时发出（厂商 nvt_ts_probe 0x286c-0x2888）---
-	 * nvt_gpio_config() 已把 GPIO60 raw 拉低并保持，这里再显式确认一次，
-	 * 然后 eng_reset -> 释放 -> 10ms。顺序错了 IC 就不会接受主机下载的固件。
+	 * Vendor nvt_ts_probe prelude (nt36532.ko 0x282c..0x288c), in the same order:
+	 *
+	 *     bl nvt_set_cs(1)                 -> CS high (pinctrl; not available here)
+	 *     bl nvt_eng_reset()               -> write 0x5A to ENG_RST_ADDR 0x7FFF80
+	 *     gpiod_set_raw_value(reset, 1)    -> release the TDDI/touch reset pin
+	 *     msleep(10)
+	 *     bl nvt_ts_check_chip_ver_trim_loop()
+	 *
+	 * This port had none of it: nvt_eng_reset() was only reachable from the
+	 * legacy download path and nvt_ts_check_chip_ver_trim() is dead code.
+	 * Without the engineering reset the IC verifies a host image and then never
+	 * starts it, so reset_state never reaches RESET_STATE_INIT.
 	 */
-	nvt_tp_reset_raw(0);
+	if (nvt_probe_eng_reset && !nvt_probe_readonly) {
+		NVT_LOG("probe prelude: nvt_eng_reset() -> 0x5A @ 0x%06X\n", ENG_RST_ADDR);
+		nvt_eng_reset();
+		/* release TP reset (raw pin 60) - vendor uses gpiod_set_raw_value(...,1) */
+		nvt_tp_reset_raw(1);
+		msleep(10);
+		NVT_LOG("probe prelude: done (ENG_RST_ADDR=0x%06X)\n", ENG_RST_ADDR);
+	}
+
+
+	if (nvt_probe_readonly) {
+		NVT_LOG("probe_readonly: skip TP_RESX pulse and eng_reset\n");
+	} else {
+		nvt_tp_reset_raw(0);
 #if NVT_TOUCH_SUPPORT_HW_RST
-	gpiod_set_value(ts->reset_gpio, 0);
+		gpiod_set_value(ts->reset_gpio, 0);
 #endif
-	mdelay(1);
-	nvt_eng_reset();
-	nvt_tp_reset_raw(1);
+		mdelay(1);
+		nvt_eng_reset();
+		nvt_tp_reset_raw(1);
 #if NVT_TOUCH_SUPPORT_HW_RST
-	gpiod_set_value(ts->reset_gpio, 1);
+		gpiod_set_value(ts->reset_gpio, 1);
 #endif
-	NVT_LOG("gpio set complete\n");
-	/* need 10ms delay after POR(power on reset) */
-	msleep(10);
+		NVT_LOG("gpio set complete\n");
+		msleep(10);
+	}
 
 	/* ---check chip version trim--- */
 	NVT_LOG("start check chip\n");

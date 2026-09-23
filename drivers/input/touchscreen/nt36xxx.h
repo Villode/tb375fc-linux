@@ -293,6 +293,15 @@ typedef enum {
 /*---extern structures---*/
 extern struct nvt_ts_data *ts;
 
+/* 寄存器转储开关（模块参数 dump_bld_bank，默认关）。
+ * 一次下载流程会调 6 次 nvt_dump_bld_bank()、失败还要重试 20 轮，
+ * 开着会把日志刷掉几千行，所以默认关闭。 */
+extern bool nvt_dump_bld_bank_en;
+extern bool nvt_tddi_preserve;
+
+/* 开机固件更新的最大重试次数（模块参数 fw_retry_max，默认 3，原硬编码 20）。 */
+extern unsigned int nvt_fw_retry_max;
+
 /*---extern functions---*/
 
 int32_t CTP_SPI_READ(struct spi_device *client, uint8_t *buf, uint16_t len);
