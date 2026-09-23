@@ -1177,3 +1177,11 @@ config COMMON_CLK_MT8516_AUDSYS
 	  This driver supports MediaTek MT8516 audsys clocks.
 
 endmenu
+
+config COMMON_CLK_MT6897_MFGCFG
+	tristate "Clock driver for MediaTek MT6897 mfgcfg"
+	depends on COMMON_CLK_MEDIATEK
+	default y
+	help
+	  This driver supports MediaTek MT6897 mfgcfg (GPU) clocks and the
+	  MFG bring-up (AOC/HWDCM/ACP/GPM).
