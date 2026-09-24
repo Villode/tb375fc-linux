@@ -11,11 +11,15 @@ KBUILD_MODPOST_FAIL_ON_WARNINGS := y
 ###############################################################################
 # Option for some ALPS specific feature, ex: AEE.
 ccflags-y += -D CONNINFRA_PLAT_ALPS=1
+ifeq ($(CONFIG_MTK_COMBO_CHIP_CONSYS_6897),y)
 ccflags-y += -D MTK_CONNINFRA_CLOCK_BUFFER_API_AVAILABLE=0
 # ^ TB375FC: =1 makes POS's conn-infra power step a bare pm_runtime_get_sync(),
 #   which does nothing because the consys device has no runtime PM bound.
 #   =0 selects consys_conninfra_on_power_ctrl_mt6897_gen(), the vendor's
 #   raw SPM CONN_PWR_CON sequence. Re-verify before flipping back.
+else
+ccflags-y += -D MTK_CONNINFRA_CLOCK_BUFFER_API_AVAILABLE=1
+endif
 ccflags-y += -DCONFIG_MTK_CONNSYS_DEDICATED_LOG_PATH
 # Mainline built-in mode: auto-start all connectivity sub-drivers from
 # conninfra after the consys platform device has probed.

@@ -28,10 +28,12 @@ export MTK_WLAN_SERVICE := yes
 #   `ccflags-y += -DBUILD_QA_DBG=0` ⇒ gl_kal.h 里 `kalPrint` 是空宏
 #   ⇒ **所有 DBGLOG 编译成空语句**，驱动 probe 路径完全静默。
 #   改成 eng 后 DBGLOG 才会进 dmesg（日志量由 aucDebugModule[] 控制）。
-export TARGET_BUILD_VARIANT := eng
+#   只让 MT6897 构建用 eng；6895 构建保持 user，避免全量调试日志。
 ifeq ($(CONFIG_MTK_COMBO_CHIP_CONSYS_6897),y)
+export TARGET_BUILD_VARIANT := eng
 export MODULE_NAME := wlan_drv_gen4m_6897
 else
+export TARGET_BUILD_VARIANT := user
 export MODULE_NAME := wlan_drv_gen4m_6895
 endif
 export CONFIG_MTK_CONNSYS_DEDICATED_LOG_PATH := y

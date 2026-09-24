@@ -1200,13 +1200,16 @@ static void set_wf_monflg_on_mailbox_wf(void)
 
 static int wf_pwr_on_consys_mcu(void)
 {
+#if IS_ENABLED(CONFIG_MTK_COMBO_CHIP_CONSYS_6897)
 	/* ★ XAGA-SKIPMCU (v42)：厂商的 soc7_0_McuInit 没有任何调用者
 	 *   （反汇编已两次确认），而我们是它的 1:1 移植且真会被调到。
 	 *   这里只跳过这一串寄存器动作，conninfra 侧上电完全不动。
 	 *   判读：若 driver-own 由此成功 ⇒ 该序列就是根因。
+	 *   仅 MT6897 构建生效；6895 构建走原本的完整序列。
 	 */
 	pr_notice("XAGA-SKIPMCU: skipping McuInit-equivalent register sequence (vendor never runs it)\n");
 	return 0;
+#endif
 
 	int ret = 0;
 	int check;
@@ -1367,6 +1370,7 @@ static int wf_pwr_on_consys_mcu(void)
 	while (value != SOC7_WFSYS_VERSION_ID &&
 	       value != SOC7_WFSYS_VERSION_ID_MT6897) {
 		if (polling_count > 10) {
+#if IS_ENABLED(CONFIG_MTK_COMBO_CHIP_CONSYS_6897)
 			/* Read-only IP identification register, and nothing below branches on
 			 * it. This port has already been bitten twice by stale MT6895-era
 			 * version constants, so warn and carry on instead of failing the
@@ -1375,6 +1379,11 @@ static int wf_pwr_on_consys_mcu(void)
 			pr_warn("XAGA-WFMCU: WFSYS version ID reads 0x%08x, expected 0x%08x - continuing\n",
 				value, SOC7_WFSYS_VERSION_ID);
 			break;
+#else
+			DBGLOG(INIT, ERROR, "Polling WFSYS version ID fail.\n");
+			ret = -1;
+			return ret;
+#endif
 		}
 		udelay(500);
 		wf_ioremap_read(WF_TOP_CFG_IP_VERSION_ADDR, &value);
@@ -1413,6 +1422,7 @@ static int wf_pwr_on_consys_mcu(void)
 	 *   0x810F0000 是 soc5_0.h 里的 DEBUG_CTRL_AO base（机械克隆带过来的）。
 	 *   先按厂商的值写，并把回读打出来供判读。
 	 */
+#if IS_ENABLED(CONFIG_MTK_COMBO_CHIP_CONSYS_6897)
 	wf_ioremap_write(WF_MCU_BUS_CR_AP2WF_REMAP_1_ADDR, 0x810A0000);
 	wf_ioremap_read(WF_MCU_BUS_CR_AP2WF_REMAP_1_ADDR, &value);
 	pr_notice("XAGA-AP2WF: 0x18400120 <- 0x810A0000 readback=0x%08x\n", value);
@@ -1422,6 +1432,10 @@ static int wf_pwr_on_consys_mcu(void)
 	/* 0x830C0120 是 WF_MCU_BUS_CR 的芯片视图地址（= AP 视图 0x18400120），
 	 * 不做 ioremap，以免碰到未映射区间。
 	 */
+#else
+	wf_ioremap_write(WF_MCU_BUS_CR_AP2WF_REMAP_1_ADDR,
+		WF_MCUSYS_INFRA_BUS_FULL_U_DEBUG_CTRL_AO_WFMCU_PWA_DEBUG_CTRL_AO_BASE);
+#endif
 
 	/* Enable debug clock (debug ctrl ao)
 	 * Address: 0x1850_0000[3]
@@ -1478,6 +1492,7 @@ static int wf_pwr_on_consys_mcu(void)
 	 * 缺这一步时：WF 加电/复位/slpprot 都过、EMI 里 LK 装的固件也在，
 	 * 但 WF CPU 不起来（0x18060B10 恒 0、ROMCODE_INDEX=0）。
 	 */
+#if IS_ENABLED(CONFIG_MTK_COMBO_CHIP_CONSYS_6897)
 	wf_ioremap_read(SOC7_REMAP0_BASE + 0xF4, &value);
 	value &= 0xFFFFFF00;
 	value |= 0x00000080;
@@ -1490,6 +1505,7 @@ static int wf_pwr_on_consys_mcu(void)
 		wf_ioremap_read(DEBUG_CTRL_AO_WFMCU_PWA_CTRL3, &chk);
 		pr_notice("XAGA-PWAF4: c3=0x%08x\n", chk);
 	}
+#endif
 
 	/* Enable wfsys bus timeout (debug ctrl ao)
 	 * Address: 0x1850_0000[4] 0x1850_0000[3] 0x1850_0000[2]
@@ -1541,6 +1557,7 @@ static int wf_pwr_on_consys_mcu(void)
 		 *   （wlan_drv_gen4m_6897.ko @0x1cbefc：rd 0x18060a10; tbnz bit30）。
 		 *   原判据（+0xB10 == 0x1D1E）是 MT6895 的 mailbox 协议，在 MT6897 上恒不成立。
 		 */
+#if IS_ENABLED(CONFIG_MTK_COMBO_CHIP_CONSYS_6897)
 		{
 			u32 xaga_a10 = 0;
 
@@ -1599,10 +1616,12 @@ static int wf_pwr_on_consys_mcu(void)
 			 *   失败分支已把 check/ret 清零 ⇒ 不改变后续 driver-own 的行为，与 v33 可比。
 			 */
 		}
+#endif
 		polling_count++;
 		udelay(1000);
 	}
 	if (check != 0) {
+#if IS_ENABLED(CONFIG_MTK_COMBO_CHIP_CONSYS_6897)
 		u32 monflg = value;
 
 		wf_ioremap_read(WF_TOP_CFG_ON_ROMCODE_INDEX_ADDR, &value);
@@ -1637,6 +1656,16 @@ static int wf_pwr_on_consys_mcu(void)
 		}
 		check = 0;
 		ret = 0;
+#else
+		DBGLOG(INIT, ERROR,
+			"Check CONNSYS power-on completion fail, 0x%08x=[0x%08x]\n",
+			CONN_HOST_CSR_TOP_WF_ON_MONFLG_OUT_ADDR, value);
+		wf_ioremap_read(WF_TOP_CFG_ON_ROMCODE_INDEX_ADDR, &value);
+		DBGLOG(INIT, ERROR,
+			"Check CONNSYS power-on completion fail, 0x%08x=[0x%08x]\n",
+			WF_TOP_CFG_ON_ROMCODE_INDEX_ADDR, value);
+		return ret;
+#endif
 	}
 
 	/* Disable conn_infra off domain force on

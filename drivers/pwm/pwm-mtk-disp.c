@@ -257,8 +257,10 @@ static int mtk_disp_pwm_probe(struct platform_device *pdev)
 
 	chip->ops = &mtk_disp_pwm_ops;
 
-	/* TB375FC: Configure GPIO 131 to Function 1 (DISP_PWM0) */
-	{
+	/* TB375FC: Configure GPIO 131 to Function 1 (DISP_PWM0).
+	 * This driver binds for every MediaTek disp-pwm compatible; the raw
+	 * pinctrl write must only run on the board that needs it. */
+	if (of_device_is_compatible(pdev->dev.of_node, "mediatek,mt6897-disp-pwm")) {
 		void __iomem *pio = ioremap(0x10005000, 0x1000);
 		if (pio) {
 			u32 val = readl(pio + 0x0400);

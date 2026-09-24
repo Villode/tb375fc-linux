@@ -109,6 +109,10 @@ static void mt6897_gpueb_state(const char *tag)
 
 static int __init mt6897_gpueb_state_early(void)
 {
+	/* Hard-coded MT6897 addresses below; skip on any other machine (the
+	 * driver is default-y for all MediaTek builds). */
+	if (!of_machine_is_compatible("mediatek,mt6897"))
+		return 0;
 	mt6897_gpueb_state("postcore");
 	return 0;
 }
@@ -116,6 +120,8 @@ postcore_initcall(mt6897_gpueb_state_early);
 
 static int __init mt6897_gpueb_state_late(void)
 {
+	if (!of_machine_is_compatible("mediatek,mt6897"))
+		return 0;
 	mt6897_gpueb_state("late");
 	return 0;
 }
@@ -354,6 +360,8 @@ static DECLARE_DELAYED_WORK(mt6897_gpueb_late_work2, mt6897_gpueb_late_probe2);
 
 static int __init mt6897_gpueb_late_sched(void)
 {
+	if (!of_machine_is_compatible("mediatek,mt6897"))
+		return 0;
 	schedule_delayed_work(&mt6897_gpueb_late_work, 20 * HZ);
 	schedule_delayed_work(&mt6897_gpueb_late_work2, 90 * HZ);
 	return 0;

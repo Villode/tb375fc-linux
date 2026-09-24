@@ -187,6 +187,11 @@ late_initcall(mt6897_gpusys_init);
 static int __init gpueb_early_probe(void)
 {
 	void __iomem *b, *s;
+
+	/* Hard-coded MT6897 addresses; skip on other machines. */
+	if (!of_machine_is_compatible("mediatek,mt6897"))
+		return 0;
+
 	b = ioremap(0x13c00000, 0x1000);
 	if (b) {
 		pr_emerg("GPUEB-EARLY: 13c00000: +0=%08X +4=%08X +8=%08X +C=%08X +80=%08X +90=%08X\n",

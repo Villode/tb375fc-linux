@@ -227,7 +227,13 @@ CONFIG_MTK_WIFI_APF_SUPPORT=y
 #CONFIG_MTK_WIFI_SNIFFER_RADIOTAP=y
 CONFIG_MTK_WIFI_NAN=n
 CONFIG_MTK_WIFI_SUPPORT_DBDC=y
+# MT6897 bring-up disables the power-on EMI ROM patch download; keep the
+# upstream =1 for the 6895 build (SOC7_0 block serves both).
+ifeq ($(WLAN_CHIP_ID),6897)
 ccflags-y += -DCFG_POWER_ON_DOWNLOAD_EMI_ROM_PATCH=0
+else
+ccflags-y += -DCFG_POWER_ON_DOWNLOAD_EMI_ROM_PATCH=1
+endif
 ccflags-y += -DCFG_ROM_PATCH_NO_SEM_CTRL=1
 ccflags-y += -DCONFIG_MTK_WIFI_HE160
 ccflags-y += -DCFG_SUPPORT_BW160

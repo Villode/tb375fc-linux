@@ -161,6 +161,7 @@ module_param_named(ap, gprifnameap, charp, 0000);
  * Open up only the bring-up path so dmesg keeps the scene for us.
  * Runtime knob: /proc/sys/net/wlan/dbgLevel (wlanSetDriverDbgLevel).
  */
+#if IS_ENABLED(CONFIG_MTK_COMBO_CHIP_CONSYS_6897)
 uint8_t aucDebugModule[DBG_MODULE_NUM] = {
 	[DBG_INIT_IDX]  = DBG_CLASS_ERROR | DBG_CLASS_WARN | DBG_CLASS_STATE |
 			DBG_CLASS_INFO,
@@ -169,6 +170,9 @@ uint8_t aucDebugModule[DBG_MODULE_NUM] = {
 	[DBG_INTR_IDX]  = DBG_CLASS_ERROR | DBG_CLASS_WARN | DBG_CLASS_STATE |
 			DBG_CLASS_INFO,
 };
+#else
+uint8_t aucDebugModule[DBG_MODULE_NUM];
+#endif
 uint32_t au4LogLevel[ENUM_WIFI_LOG_MODULE_NUM] = { ENUM_WIFI_LOG_LEVEL_DEFAULT };
 
 /* 4 2007/06/26, mikewu, now we don't use this, we just fix the number of wlan
@@ -1826,6 +1830,7 @@ void wlanDebugInit(void)
 	/* enable all */
 	wlanSetDriverDbgLevel(DBG_ALL_MODULE_IDX, DBG_CLASS_MASK);
 #else
+#if IS_ENABLED(CONFIG_MTK_COMBO_CHIP_CONSYS_6897)
 	/* ★ 2026-09-20 TB375FC：原来无条件
 	 *     wlanSetDriverDbgLevel(DBG_ALL_MODULE_IDX, DBG_LOG_LEVEL_DEFAULT);
 	 *   而 DBG_LOG_LEVEL_DEFAULT == DBG_CLASS_ERROR ⇒ 运行期把本文件
@@ -1839,6 +1844,13 @@ void wlanDebugInit(void)
 	wlanSetDriverDbgLevel(DBG_INIT_IDX, XAGA_DBG_LEVELS);
 	wlanSetDriverDbgLevel(DBG_HAL_IDX, XAGA_DBG_LEVELS);
 	wlanSetDriverDbgLevel(DBG_INTR_IDX, XAGA_DBG_LEVELS);
+#else
+#ifdef CFG_DEFAULT_DBG_LEVEL
+	wlanSetDriverDbgLevel(DBG_ALL_MODULE_IDX, CFG_DEFAULT_DBG_LEVEL);
+#else
+	wlanSetDriverDbgLevel(DBG_ALL_MODULE_IDX, DBG_LOG_LEVEL_DEFAULT);
+#endif
+#endif
 #endif /* DBG */
 
 	LOG_FUNC("Reset ALL DBG module log level to DEFAULT!");

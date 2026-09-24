@@ -536,6 +536,7 @@ u_int8_t halSetDriverOwn(IN struct ADAPTER *prAdapter)
 			  prBusInfo->fw_own_clear_addr,
 			  prBusInfo->fw_own_clear_bit);
 	}
+#if IS_ENABLED(CONFIG_MTK_COMBO_CHIP_CONSYS_6897)
 	{
 		uint32_t xaga_v = 0;
 
@@ -547,7 +548,7 @@ u_int8_t halSetDriverOwn(IN struct ADAPTER *prAdapter)
 		pr_notice("XAGA-OWN: after  0xB04=0x1d, 0xB10=0x%08x\n", xaga_v);
 	}
 
-		/* ★ XAGA-LPCTLW2 (v41)：区分「寄存器不可写」vs「写生效但硬件重置位」。
+	/* ★ XAGA-LPCTLW2 (v41)：区分「寄存器不可写」vs「写生效但硬件重置位」。
 	 *   方法：写硬件不驱动的空闲位（bit16 / bit3），看是否粘住。
 	 *   0x18060014 作为阳性对照（驱动自己把它当 fw_own_clear 写）。
 	 */
@@ -585,6 +586,7 @@ u_int8_t halSetDriverOwn(IN struct ADAPTER *prAdapter)
 		/* 恢复：把 own 交回 FW */
 		HAL_MCR_WR(prAdapter, 0x7C060010, 0x2);
 	}
+#endif
 
 	while (1) {
 		if (!prBusInfo->fgCheckDriverOwnInt ||

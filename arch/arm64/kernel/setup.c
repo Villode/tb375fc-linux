@@ -56,6 +56,7 @@
 #include <asm/traps.h>
 #include <asm/efi.h>
 #include <asm/xen/hypervisor.h>
+#include <asm/memory.h>
 #include <asm/mmu_context.h>
 
 /*
@@ -875,6 +876,33 @@ void tb_wdt_disable(void);
 #define TB_WDT_KEY    0x22000000u
 
 static bool tb_canary_active = true;
+
+/* These hooks hard-code TB375FC physical addresses (watchdog 0x1c00a000,
+ * LK framebuffer 0xfc16f000); on any other machine they would write to an
+ * unrelated physical address. Gate on the bootloader FDT's root compatible
+ * (available before unflatten_device_tree, present on both LK's Android DT
+ * and the embedded mt6897 DTB).
+ */
+static bool __init tb_is_mt6897(void)
+{
+	const void *fdt;
+	int node;
+
+	/* __fdt_pointer is a physical address; the bootloader DTB sits in
+	 * linear-mapped RAM, so __va() gives a usable VA before unflatten.
+	 */
+	if (!__fdt_pointer)
+		return false;
+	fdt = (const void *)__va(__fdt_pointer);
+	if (!fdt || fdt_check_header(fdt))
+		return false;
+	node = fdt_path_offset(fdt, "/");
+	if (node < 0)
+		return false;
+	return !fdt_node_check_compatible(fdt, node, "mediatek,mt6897") ||
+	       !fdt_node_check_compatible(fdt, node, "lenovo,tb375fc");
+}
+
 static void __init tb_canary_stop(void)
 {
 	tb_canary_active = false;
@@ -905,7 +933,7 @@ static void __init tb_draw(int n)
 	int y, x, k, r, rows;
 	unsigned long bytes;
 
-	if (!tb_canary_active)
+	if (!tb_canary_active || !tb_is_mt6897())
 		return;
 
 	for (y = 0; y < TB_FB_H; y += TB_CHUNK_ROWS) {
@@ -949,6 +977,8 @@ static void __init tb_draw(int n)
 
 void __init tb_canary(int n)
 {
+	if (!tb_is_mt6897())
+		return;
 	if (n > TB_MAXBLK)
 		n = TB_MAXBLK;
 	tb_draw(n);
@@ -958,13 +988,20 @@ void __init tb_canary(int n)
 /* 出场信号：一条整条实心白，跟后面的"方块"明显不同 */
 void __init tb_canary_solid(void)
 {
+	if (!tb_is_mt6897())
+		return;
 	tb_draw(-1);
 	tb_delay_ms(TB_HOLD_MS);
 }
 
 void __init tb_wdt_disable(void)
 {
-	void __iomem *rgu = early_ioremap(TB_RGU_PHYS, 0x100);
+	void __iomem *rgu;
+
+	if (!tb_is_mt6897())
+		return;
+
+	rgu = early_ioremap(TB_RGU_PHYS, 0x100);
 
 	if (rgu) {
 		writel(TB_WDT_KEY, rgu + TB_WDT_MODE);   /* KEY + ENABLE=0 => 关狗 */
