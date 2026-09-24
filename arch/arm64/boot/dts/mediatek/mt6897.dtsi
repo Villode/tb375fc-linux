@@ -227,7 +227,7 @@
 		 * 等 clk-mt6897 / pinctrl-mt6897 落地后再逐个启用。
 		 */
 
-		/* 引脚控制器（厂商 DTB 10 段 reg） */
+		/* 引脚控制器（厂商 DTB 10 段 reg + 同名 reg-names） */
 		pio: pinctrl@10005000 {
 			compatible = "mediatek,mt6897-pinctrl";
 			reg = <0x0 0x10005000 0x0 0x1000>,
@@ -240,14 +240,35 @@
 			      <0x0 0x11eb0000 0x0 0x1000>,
 			      <0x0 0x11f20000 0x0 0x1000>,
 			      <0x0 0x11f30000 0x0 0x1000>;
+			reg-names = "gpio", "iocfg_rt", "iocfg_rm",
+				    "iocfg_bl", "iocfg_bm", "iocfg_br",
+				    "iocfg_lb", "iocfg_lt", "iocfg_tm",
+				    "iocfg_tl";
 			gpio-controller;
 			#gpio-cells = <2>;
+			gpio-ranges = <&pio 0 0 232>;
 			interrupt-controller;
 			#interrupt-cells = <2>;
-			/* pinctrl-mt6897 驱动尚不存在：标 disabled，防止依赖它的
-			 * GPIO/EINT 消费者误以为 provider 可用。SPI 触摸等 GPIO
-			 * 描述符在驱动落地前照旧无法解析，属预期。 */
-			status = "disabled";
+			mediatek,eint = <&apirq>;
+		};
+
+		/*
+		 * EINT 五段寄存器组（厂商 DTB apirq@11ce0000，reg-name
+		 * 顺序 eint-e/s/w/n/c，与 mt6895 的 w/e/s/n/c 不同）。
+		 * EINT 号 -> (bank, index) 矩阵在 pinctrl-mt6897.c 内。
+		 */
+		apirq: apirq@11ce0000 {
+			compatible = "mediatek,mt6983-eint";
+			reg = <0x0 0x11ce0000 0x0 0x1000>,
+			      <0x0 0x11de0000 0x0 0x1000>,
+			      <0x0 0x11e90000 0x0 0x1000>,
+			      <0x0 0x11fe0000 0x0 0x1000>,
+			      <0x0 0x1c01e000 0x0 0x1000>;
+			reg-names = "eint-e", "eint-s", "eint-w",
+				    "eint-n", "eint-c";
+			interrupts = <GIC_SPI 309 IRQ_TYPE_LEVEL_HIGH 0>;
+			mediatek,total-pin-number = <250>;
+			mediatek,instance-num = <5>;
 		};
 
 		/* 时钟/系统控制寄存器（先登记，等 clk-mt6897） */
