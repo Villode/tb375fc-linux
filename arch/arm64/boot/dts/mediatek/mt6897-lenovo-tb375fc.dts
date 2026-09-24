@@ -339,6 +339,8 @@
 			 46  53  60  68  77  87  98 110 123 137
 			152 168 185 203 222 242 255
 		>;
+		/* pwm-backlight 的 default-brightness-level 是 **索引** 不是亮度值：
+		 * 20 → brightness-levels[20] = 46。 */
 		default-brightness-level = <20>;
 		status = "okay";
 	};
@@ -401,10 +403,9 @@
  * 佐证：同一控制器内部回环在 CFG2=0x00010001 时数据被破坏（a5a5→b4b4），
  *       在 CFG2=0x000a000a 时完全正确 —— 0x0a 正是 9.6 MHz 目标对应的取值。
  *
- * ★ spi-max-frequency = 1 MHz 是刻意保守值（loopback 验证过的安全档）：
- * 208 MHz 是回环计时反推的估计值，非时钟树确证；按 1 MHz 请求即使 f_mod 有
- * 数倍偏差，SCLK 仍远低于 NT36532 的 9.6 MHz 上限。代价只是传输慢（本阶段
- * 已关闭 boot 固件升级，只传小包，无影响）。首触成功后再提到 9.6 MHz。
+ * spi-max-frequency 已提到 9.6 MHz（NT36532 规格上限，= 厂商 DTBO 0x927c00）。
+ * 208 MHz 是回环计时反推的估计值，非时钟树确证；以 9.6 MHz 请求即使在
+ * f_mod 估计偏差下，CFG2 求值也保持在验证过的 0x000a000a 档。
  */
 / {
 	spi_mclk: spi-mclk {
@@ -417,7 +418,7 @@
 &spi2 {
 	clocks = <&clk26m>, <&clk26m>, <&spi_mclk>;
 	clock-names = "parent-clk", "sel-clk", "spi-clk";
-	mediatek,pad-select = <0x00>;
+	/* mt6985_compat 无 need_pad_sel，pad-select 不生效，省略。 */
 	mediatek,tickdly = <0x03 0x00>;
 	status = "okay";
 

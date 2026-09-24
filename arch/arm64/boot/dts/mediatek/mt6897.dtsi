@@ -244,8 +244,10 @@
 			#gpio-cells = <2>;
 			interrupt-controller;
 			#interrupt-cells = <2>;
-			/* Required by SPI touch GPIO descriptors and GPIO9 EINT. */
-			status = "okay";
+			/* pinctrl-mt6897 驱动尚不存在：标 disabled，防止依赖它的
+			 * GPIO/EINT 消费者误以为 provider 可用。SPI 触摸等 GPIO
+			 * 描述符在驱动落地前照旧无法解析，属预期。 */
+			status = "disabled";
 		};
 
 		/* 时钟/系统控制寄存器（先登记，等 clk-mt6897） */
@@ -320,27 +322,27 @@
 		 * i2c7 = 0x11d02000：电量计 mm8013@0x55（厂商同名 i2c7）+ fsa4480@0x43
 		 * 第二个 reg 是 APDMA 同步寄存器 —— mt6895_compat.apdma_sync = 1，必需。
 		 */
-			i2c5: i2c@11f01000 {
+		i2c5: i2c@11f01000 {
 			compatible = "mediatek,mt6897-i2c";
 			reg = <0x0 0x11f01000 0x0 0x1000>,
 			      <0x0 0x11300580 0x0 0x80>;
 			interrupts = <GIC_SPI 191 IRQ_TYPE_LEVEL_HIGH 0>;
 			clocks = <&i2c_mclk>, <&i2c_mclk>;
-				clock-names = "main", "dma";
-				clock-div = <1>;
+			clock-names = "main", "dma";
+			clock-div = <1>;
 			#address-cells = <1>;
 			#size-cells = <0>;
 			status = "disabled";
 		};
 
-			i2c7: i2c@11d02000 {
+		i2c7: i2c@11d02000 {
 			compatible = "mediatek,mt6897-i2c";
 			reg = <0x0 0x11d02000 0x0 0x1000>,
 			      <0x0 0x11300680 0x0 0x100>;
 			interrupts = <GIC_SPI 193 IRQ_TYPE_LEVEL_HIGH 0>;
 			clocks = <&i2c_mclk>, <&i2c_mclk>;
-				clock-names = "main", "dma";
-				clock-div = <1>;
+			clock-names = "main", "dma";
+			clock-div = <1>;
 			#address-cells = <1>;
 			#size-cells = <0>;
 			status = "disabled";
@@ -356,9 +358,11 @@
 			reg-names = "pmif", "spmimst", "pmif-p", "spmimst-p";
 			clocks = <&clk26m>, <&clk26m>, <&clk26m>;
 			clock-names = "pmif_sys_ck", "pmif_tmr_ck", "spmimst_clk_mux";
-			/* PMIC INT 线接在 GPIO EINT 248 上（原厂 DTB 实测） */
-			interrupts-extended = <&pio 248 IRQ_TYPE_LEVEL_HIGH>;
-			interrupt-names = "rcs_irq";
+			/* PMIC INT 线走 GPIO EINT 248（原厂 DTB 实测），但 MT6897 的
+			 * EINT 编码与我们的 4-cell GIC 对不上、且 pinctrl 驱动未落地，
+			 * 刻意不接 upstream 中断：mtk-spmi-pmic 拿不到 irq 时降级为
+			 * 轮询模式。interrupt-controller/#interrupt-cells 保留 ——
+			 * spmi 本身仍是 PMIC 子设备（按键/温控）的中断父。 */
 			interrupt-controller;
 			#interrupt-cells = <1>;
 			#address-cells = <2>;
@@ -430,7 +434,8 @@
 			interrupts = <GIC_SPI 244 IRQ_TYPE_LEVEL_HIGH 0>;
 			clocks = <&clk26m>, <&clk26m>, <&clk26m>;
 			clock-names = "parent-clk", "sel-clk", "spi-clk";
-			mediatek,pad-select = <0x00>;
+			/* 首条 compatible 命中 mt6985_compat（无 need_pad_sel），
+			 * mediatek,pad-select 不会被驱动读取，故不写。 */
 			mediatek,tickdly = <0x03 0x00>;
 			#address-cells = <1>;
 			#size-cells = <0>;

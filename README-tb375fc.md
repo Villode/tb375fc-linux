@@ -11,6 +11,7 @@ GitHub 上只有 **`main`** 一个分支，全部内核历史与全部自有改�
 
 | 改动 | commit |
 |---|---|
+| 工作树 checkpoint（首批底层改动） | `aef99312c` |
 | MT6897 / TB375FC 设备树 | `4de7a0a87` |
 | MT6897 mfgcfg 时钟 | `a85293bd3` |
 | MT6897 scpsys 电源域 + GPU EB | `c5c79f641` |
@@ -18,7 +19,7 @@ GitHub 上只有 **`main`** 一个分支，全部内核历史与全部自有改�
 | nt36xxx 触摸屏（BOE / TM 双面板） | `0f7d7c570` |
 | connectivity MT6897 (soc7_0) 平台支持 | `15a563c84` |
 | MT6897 WiFi / BT 独立开发线 | `375cfe902`、`0ab6b6cc3`（见下文合并说明） |
-| 文档 | `4592bf5f1`、`89ceed2c9` |
+| 文档 | `4592bf5f1`、`89ceed2c9`、`a887fcc34` |
 
 `aef99312c` 是动手前的状态存档，`df71e0fda` 是 WiFi/BT 那条线的合并点。
 
@@ -37,12 +38,12 @@ GPL-2.0 要求的来源可追溯性，本项目不做。
 |---|---|
 | Linux 主线 | `torvalds/linux`，v7.2.0（见 `Makefile`） |
 | MT6895 平台分支 | `MT6895-Mainline/linux` 的 `7.2-mt6895-xiaomi-xaga`，起点 commit `33f2f15a3` |
-| 本项目 | `33f2f15a3` 之后的 12 个 commit（11 个非 merge + 1 个合并点），全部作者为本项目 |
+| 本项目 | `33f2f15a3` 之后的 13 个可到达 commit（12 个非 merge + 1 个合并点 `df71e0fda`；first-parent 主线 11 个），全部作者为本项目 |
 
 与 `MT6895-Mainline/linux` 的关系**只到 `33f2f15a3` 为止**：自那以后本树独立演进，
 不跟随该分支（截至 2026-09-23 它已另行推进到 `b1138393d`），也没有从它合并过任何 commit。
 本项目的设备树、电源域、mfgcfg 时钟、充电、触摸屏、connectivity 平台支持都是独立实现，
-表中列出的 12 个 commit 即可全部核对归属。
+表中列出的这些 commit 即可全部核对归属（合并点 `df71e0fda` 见下文）。
 
 配套的用户态与调试工具在另一个仓库 `tb375fc-linux-utils`，与本仓库历史完全分离，
 不含对方的任何 commit。
