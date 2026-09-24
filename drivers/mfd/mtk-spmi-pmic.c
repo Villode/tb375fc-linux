@@ -605,9 +605,6 @@ static int mtk_spmi_pmic_probe(struct spmi_device *sdev)
 			core->irq_domain = NULL;
 			return devm_of_platform_populate(&sdev->dev);
 		}
-		return dev_err_probe(&sdev->dev, core->irq,
-				     "PMIC irq parent not ready\n");
-
 		ret = mtk_spmi_pmic_irq_init(core);
 		if (ret)
 			return dev_err_probe(&sdev->dev, ret,

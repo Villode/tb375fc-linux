@@ -237,6 +237,7 @@ static const struct mtk_spi_compatible mt6985_compat = {
 };
 
 static const struct mtk_spi_compatible mt6983_compat = {
+	.need_pad_sel = true,
 	.must_tx = true,
 	.enhance_timing = true,
 	.dma_ext = true,
@@ -501,40 +502,6 @@ static int mtk_spi_unprepare_message(struct spi_controller *host,
 
 	cpu_latency_qos_update_request(&mdata->qos_request, PM_QOS_DEFAULT_VALUE);
 	return 0;
-}
-
-/*
- * CS 控制回到主线行为（2026-09-12）。
- *
- * 此前这里被改写成操纵 SPI_CMD_CS_POL(bit7) —— 对 active-low 器件，在「撤销片选」
- * 分支把极性位置 1 会让 CS 引脚在事务之间停在低电平，等于永远保持选中；
- * Novatek 的协议靠 CS 上升沿来界定帧，CS 不释放时从机不会回数据，
- * 与实测「写真实数据、读回全 0」的症状完全吻合。该改动也没有带来任何观测收益
- * （内部回环不经过 pad，看不出差别），因此回退，并通过 spi->mode / SPI_CS_HIGH
- * 走 hw_init 里的标准极性配置。
- */
-static void mtk_nvt_manual_cs(struct spi_device *spi, bool asserted)
-{
-	void __iomem *g; u32 v;
-	if (!spi->dev.of_node || !of_device_is_compatible(spi->dev.of_node, "novatek,NVT-ts-spi"))
-		return;
-	g = ioremap(0x10005000, 0x1000);
-	if (!g) return;
-	/* GPIO12 mode nibble is bits 0..3 in MODE register 0x320. */
-	v = readl(g + 0x320);
-	v &= ~0xf;
-	if (asserted) {
-		/* vendor nt36532_spi_cs_low: GPIO output low */
-		writel(v, g + 0x320);
-		v = readl(g + 0x100);
-		v &= ~(1 << 12);
-		writel(v, g + 0x100);
-	} else {
-		/* vendor nt36532_spi_cs_high: return GPIO12 to SPI mode 1 */
-		v |= 1;
-		writel(v, g + 0x320);
-	}
-	iounmap(g);
 }
 
 static void mtk_spi_set_cs(struct spi_device *spi, bool enable)

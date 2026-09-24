@@ -195,7 +195,7 @@ MODULE_PARM_DESC(dump_bld_bank,
  * 失败 3 次和失败 20 次结果一样（IC 状态不会自己变好），所以 3 次足够。
  * 需要长时间反复试探时用 nt36xxx_ts.fw_retry_max=20 恢复原行为。
  */
-static unsigned int nvt_fw_retry_max = 3;
+unsigned int nvt_fw_retry_max = 3;
 module_param_named(fw_retry_max, nvt_fw_retry_max, uint, 0644);
 MODULE_PARM_DESC(fw_retry_max,
 	"Max firmware-update retries at boot (default 3; the original hard-coded value was 20)");

@@ -1423,7 +1423,7 @@ config TOUCHSCREEN_NVT_TS_SPI
 	  If unsure, say N.
 
 	  To compile this driver as a module, choose M here: the
-	  module will be called himax_hx83112b.
+	  module will be called nt36xxx_ts.
 
 config TOUCHSCREEN_NVT_DEBUG_FS
 	bool "Novatek NT36xxx touchscreen debugfs interface"
