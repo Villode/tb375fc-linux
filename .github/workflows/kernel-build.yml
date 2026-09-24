@@ -1,0 +1,78 @@
+name: kernel-build
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Baseline upstream arm64 defconfig. ARCH_MEDIATEK=y pulls in the
+          # MT6897 pinctrl driver (default-y) and every dts under mediatek/,
+          # so this alone compile-checks pinctrl-mt6897.c and the board DTB.
+          - name: defconfig
+            fragments: ""
+
+          # Historical xaga config: defconfig + xaga.config. Builds nt36xxx,
+          # charger bits, and the connectivity stack. NOTE: MTK_COMBO=y also
+          # enables MTK_COMBO_CHIP_CONSYS_6897 (default y), so the 6897-gated
+          # code paths are what actually compile here.
+          - name: xaga
+            fragments: "arch/arm64/configs/xaga.config"
+
+          # xaga intent with the MT6897 experiments disabled: compiles the
+          # #else / non-6897 code paths in soc7_0, hal_pdma, btmtk_main, etc.
+          - name: xaga-no-consys6897
+            fragments: "arch/arm64/configs/xaga.config"
+            extra_config: |
+              CONFIG_MTK_COMBO_CHIP_CONSYS_6897=n
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu bc bison flex libssl-dev libelf-dev \
+            device-tree-compiler make
+
+      - name: Configure
+        run: |
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          make O=out defconfig
+          if [ -n "${{ matrix.fragments }}" ]; then
+            scripts/kconfig/merge_config.sh -m -O out \
+              out/.config ${{ matrix.fragments }}
+          fi
+          if [ -n "${{ matrix.extra_config }}" ]; then
+            echo "${{ matrix.extra_config }}" >> out/.config
+          fi
+          make O=out olddefconfig
+
+      - name: Build Image + dtbs
+        run: |
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          make -j"$(nproc)" O=out Image dtbs
+
+      - name: Build modules
+        run: |
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          make -j"$(nproc)" O=out modules
+
+      - name: Check board DTB
+        run: |
+          test -f out/arch/arm64/boot/dts/mediatek/mt6897-lenovo-tb375fc.dtb || \
+            { echo "mt6897-lenovo-tb375fc.dtb not built"; exit 1; }
